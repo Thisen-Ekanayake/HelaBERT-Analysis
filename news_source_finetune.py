@@ -49,11 +49,11 @@ DATA_PATH = "data/Sinhala-News-Source-classification/sinhala-news-sources.csv"
 
 # Training Parameters
 NUM_LABELS = 9  # Number of news source classes (will be auto-detected)
-MAX_LENGTH = 512  # Maximum sequence length
-TRAIN_BATCH_SIZE = 16
-EVAL_BATCH_SIZE = 16
-LEARNING_RATE = 5e-5  # Typical fine-tuning LR for BERT
-NUM_EPOCHS = 10
+MAX_LENGTH = 64  # Maximum sequence length
+TRAIN_BATCH_SIZE = 64
+EVAL_BATCH_SIZE = 64
+LEARNING_RATE = 1e-5  # Typical fine-tuning LR for BERT
+NUM_EPOCHS = 20
 WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.01
 GRADIENT_ACCUMULATION_STEPS = 1  # Increase if you need larger effective batch size
@@ -559,6 +559,7 @@ training_args = TrainingArguments(
     per_device_eval_batch_size=EVAL_BATCH_SIZE,
     gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
     learning_rate=LEARNING_RATE,
+    lr_scheduler_type="cosine",
     weight_decay=WEIGHT_DECAY,
     warmup_ratio=WARMUP_RATIO,
     
