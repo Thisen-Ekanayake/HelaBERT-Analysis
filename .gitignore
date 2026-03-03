@@ -3,5 +3,6 @@ tokenizer/
 Sinhala-text-classification/
 SinBERT-large/
 SinBERT-small/
+data/
 
 model_card.md
