@@ -4,5 +4,10 @@ Sinhala-text-classification/
 SinBERT-large/
 SinBERT-small/
 data/
+HelaBERT_finetuned_news_source/
+
+.venv/
+wandb/
 
 model_card.md
+*.txt
