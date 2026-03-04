@@ -52,10 +52,10 @@ NUM_LABELS = 9  # Number of news source classes (will be auto-detected)
 MAX_LENGTH = 64  # Maximum sequence length
 TRAIN_BATCH_SIZE = 64
 EVAL_BATCH_SIZE = 64
-LEARNING_RATE = 1e-5  # Typical fine-tuning LR for BERT
-NUM_EPOCHS = 20
+LEARNING_RATE = 2e-5  # Typical fine-tuning LR for BERT
+NUM_EPOCHS = 10
 WARMUP_RATIO = 0.1
-WEIGHT_DECAY = 0.01
+WEIGHT_DECAY = 0.05
 GRADIENT_ACCUMULATION_STEPS = 1  # Increase if you need larger effective batch size
 
 # Output Directory
