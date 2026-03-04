@@ -4,7 +4,12 @@ Sinhala-text-classification/
 SinBERT-large/
 SinBERT-small/
 data/
+
 HelaBERT_finetuned_news_source/
+HelaBERT_finetuned_news_category/
+HelaBERT_finetuned_sentiment/
+HelaBERT_sentiment_comments_only/
+HelaBERT_sentiment_crossattn/
 
 .venv/
 wandb/
