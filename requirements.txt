@@ -1,0 +1,39 @@
+# Core deep learning
+torch
+torchvision
+torchaudio
+
+# Transformers & training utilities
+transformers
+accelerate
+datasets
+tokenizers
+
+# Tokenization
+sentencepiece
+
+# Data handling
+numpy
+pandas
+pyarrow
+tqdm
+
+# Experiment tracking 
+wandb
+
+# Config & serialization
+pyyaml
+jsonlines
+
+# Logging & debugging
+rich
+
+# Evaluation (BLEU, ROUGE, BERTScore, etc.)
+evaluate
+sacrebleu
+rouge-score
+bert-score
+
+# Visualization
+matplotlib
+seaborn
