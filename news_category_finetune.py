@@ -11,6 +11,12 @@ Expected CSV format:
 """
 
 import os
+import smtplib
+import traceback
+import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
 import numpy as np
 import pandas as pd
 import torch
@@ -37,6 +43,131 @@ from transformers import (
 )
 import random
 import wandb
+from dotenv import load_dotenv
+
+# ==================== LOAD ENVIRONMENT VARIABLES ====================
+load_dotenv()  # Loads variables from .env file into os.environ
+
+
+# ==================== EMAIL NOTIFICATION SETUP ====================
+
+# Email settings — all loaded from .env
+EMAIL_NOTIFICATIONS_ENABLED = os.getenv("EMAIL_NOTIFICATIONS_ENABLED", "true").lower() == "true"
+EMAIL_SENDER        = os.getenv("EMAIL_SENDER")           # e.g. yourname@gmail.com
+EMAIL_PASSWORD      = os.getenv("EMAIL_APP_PASSWORD")     # App password (not your login password)
+EMAIL_RECIPIENT     = os.getenv("EMAIL_RECIPIENT")        # Where to send notifications
+EMAIL_SMTP_HOST     = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
+EMAIL_SMTP_PORT     = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+TRAINING_JOB_NAME   = os.getenv("TRAINING_JOB_NAME", "BERT News Category Fine-tuning")
+
+
+def send_email_notification(subject: str, body_html: str, body_text: str = None):
+    """Send an email notification. Silently skips if email is not configured."""
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        print("ℹ️  Email notifications disabled (EMAIL_NOTIFICATIONS_ENABLED=false)")
+        return
+    if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECIPIENT]):
+        print("⚠️  Email notification skipped — EMAIL_SENDER, EMAIL_APP_PASSWORD, "
+              "or EMAIL_RECIPIENT not set in .env")
+        return
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = EMAIL_SENDER
+        msg["To"]      = EMAIL_RECIPIENT
+
+        if body_text:
+            msg.attach(MIMEText(body_text, "plain"))
+        msg.attach(MIMEText(body_html, "html"))
+
+        with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
+
+        print(f"✉️  Notification email sent to: {EMAIL_RECIPIENT}")
+
+    except Exception as e:
+        print(f"⚠️  Failed to send email notification: {e}")
+
+
+def _build_success_email(summary: dict, eval_results: dict, wandb_url: str = None) -> tuple:
+    """Build success email content. Returns (subject, html, plain_text)."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    wandb_section = (
+        f'<p>📊 <a href="{wandb_url}">View full W&amp;B dashboard</a></p>'
+        if wandb_url else ""
+    )
+
+    metric_rows = "".join(
+        f"<tr><td style='padding:4px 12px'>{k}</td>"
+        f"<td style='padding:4px 12px'><b>"
+        f"{(f'{v:.4f}' if isinstance(v, float) else str(v))}"
+        f"</b></td></tr>"
+        for k, v in summary.items()
+    )
+
+    html = f"""
+    <html><body style='font-family:Arial,sans-serif;color:#222'>
+      <h2 style='color:#2e7d32'>✅ Training Completed Successfully</h2>
+      <p><b>Job:</b> {TRAINING_JOB_NAME}</p>
+      <p><b>Finished at:</b> {timestamp}</p>
+      <h3>Final Metrics</h3>
+      <table border='1' cellspacing='0' cellpadding='0'
+             style='border-collapse:collapse;font-size:14px'>
+        <tr style='background:#e8f5e9'>
+          <th style='padding:6px 12px'>Metric</th>
+          <th style='padding:6px 12px'>Value</th>
+        </tr>
+        {metric_rows}
+      </table>
+      {wandb_section}
+      <p style='color:#888;font-size:12px'>Sent by news_category_finetune.py</p>
+    </body></html>
+    """
+    plain = (
+        f"Training Completed Successfully\n"
+        f"Job: {TRAINING_JOB_NAME}\n"
+        f"Finished at: {timestamp}\n\n"
+        + "\n".join(
+            f"{k}: {f'{v:.4f}' if isinstance(v, float) else str(v)}"
+            for k, v in summary.items()
+        )
+        + (f"\n\nW&B: {wandb_url}" if wandb_url else "")
+    )
+    subject = f"✅ Training Complete — {TRAINING_JOB_NAME}"
+    return subject, html, plain
+
+
+def _build_failure_email(error: Exception, tb_str: str) -> tuple:
+    """Build crash email content. Returns (subject, html, plain_text)."""
+    timestamp  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    error_type = type(error).__name__
+    error_msg  = str(error)
+    tb_escaped = tb_str.replace("<", "&lt;").replace(">", "&gt;")
+
+    html = f"""
+    <html><body style='font-family:Arial,sans-serif;color:#222'>
+      <h2 style='color:#c62828'>❌ Training Crashed</h2>
+      <p><b>Job:</b> {TRAINING_JOB_NAME}</p>
+      <p><b>Crashed at:</b> {timestamp}</p>
+      <p><b>Error:</b> <span style='color:#c62828'>{error_type}: {error_msg}</span></p>
+      <h3>Traceback</h3>
+      <pre style='background:#f5f5f5;padding:12px;font-size:12px;overflow:auto'>{tb_escaped}</pre>
+      <p style='color:#888;font-size:12px'>Sent by news_category_finetune.py</p>
+    </body></html>
+    """
+    plain = (
+        f"Training Crashed\n"
+        f"Job: {TRAINING_JOB_NAME}\n"
+        f"Crashed at: {timestamp}\n\n"
+        f"Error: {error_type}: {error_msg}\n\n"
+        f"Traceback:\n{tb_str}"
+    )
+    subject = f"❌ Training Crashed — {TRAINING_JOB_NAME}"
+    return subject, html, plain
 
 
 # ==================== CONFIGURATION ====================
@@ -67,7 +198,7 @@ MAX_LENGTH = 256        # Longer than source task — category may need more con
 TRAIN_BATCH_SIZE = 8
 EVAL_BATCH_SIZE = 8
 LEARNING_RATE = 2e-5
-NUM_EPOCHS = 15
+NUM_EPOCHS = 1
 WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.05
 GRADIENT_ACCUMULATION_STEPS = 1
@@ -598,12 +729,20 @@ except KeyboardInterrupt:
     print(f"✓ Model saved to {OUTPUT_DIR}/interrupted_model")
     if USE_WANDB:
         wandb.finish(exit_code=1)
+    _subj, _html, _plain = _build_failure_email(
+        KeyboardInterrupt("Training was manually interrupted (KeyboardInterrupt)"),
+        "Training was manually interrupted by the user."
+    )
+    send_email_notification(_subj, _html, _plain)
     raise
 
 except Exception as e:
+    tb_str = traceback.format_exc()
     print(f"\n❌ Training failed: {e}")
     if USE_WANDB:
         wandb.finish(exit_code=1)
+    _subj, _html, _plain = _build_failure_email(e, tb_str)
+    send_email_notification(_subj, _html, _plain)
     raise
 
 
@@ -618,15 +757,7 @@ if config:
     config.save_pretrained(final_model_path)
 print(f"✓ Final model saved to: {final_model_path}")
 
-if USE_WANDB:
-    artifact = wandb.Artifact(
-        name=f"bert-news-category-{wandb.run.id}",
-        type="model",
-        description="Fine-tuned BERT for 5-class news category classification"
-    )
-    artifact.add_dir(final_model_path)
-    wandb.log_artifact(artifact)
-    print("✓ Model artifact logged to W&B")
+
 
 
 # ==================== EVALUATE MODEL ====================
@@ -902,7 +1033,18 @@ print(f"  - Recall:              {eval_results['eval_recall']:.4f}")
 
 if USE_WANDB:
     print(f"\n📊 View full results at: {wandb.run.get_url()}")
+    _wandb_url = wandb.run.get_url()
     wandb.finish()
     print("✓ W&B run finished")
+else:
+    _wandb_url = None
+
+# ==================== SEND COMPLETION EMAIL ====================
+print("\n" + "=" * 80)
+print("SENDING COMPLETION NOTIFICATION")
+print("=" * 80)
+
+_subj, _html, _plain = _build_success_email(summary, eval_results, _wandb_url)
+send_email_notification(_subj, _html, _plain)
 
 print("\n" + "=" * 80)
