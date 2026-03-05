@@ -17,4 +17,6 @@ wandb/
 model_card.md
 *.txt
 
+.env
+
 !requirements.txt
