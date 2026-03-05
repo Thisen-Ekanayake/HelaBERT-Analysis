@@ -58,7 +58,7 @@ EMAIL_PASSWORD      = os.getenv("EMAIL_APP_PASSWORD")     # App password (not yo
 EMAIL_RECIPIENT     = os.getenv("EMAIL_RECIPIENT")        # Where to send notifications
 EMAIL_SMTP_HOST     = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
 EMAIL_SMTP_PORT     = int(os.getenv("EMAIL_SMTP_PORT", "587"))
-TRAINING_JOB_NAME   = os.getenv("TRAINING_JOB_NAME", "BERT News Category Fine-tuning")
+TRAINING_JOB_NAME   = os.getenv("TRAINING_news_category", "BERT News Category Fine-tuning")
 
 
 def send_email_notification(subject: str, body_html: str, body_text: str = None):
