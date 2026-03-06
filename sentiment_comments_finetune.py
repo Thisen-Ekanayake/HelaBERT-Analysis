@@ -73,7 +73,7 @@ WEIGHT_DECAY                = 0.05
 GRADIENT_ACCUMULATION_STEPS = 1
 EVAL_BATCH_SIZE_FIXED       = 64     # constant eval batch across all runs
 RANDOM_SEED                 = 42
-USE_FP16                    = True
+USE_BF16                    = True
 NUM_WORKERS                 = 2
 
 USE_WANDB     = True
@@ -435,7 +435,7 @@ for run_idx, (bs, lr, wr) in enumerate(grid, start=1):
         metric_for_best_model="f1",
         greater_is_better=True,
         save_total_limit=1,          # keep only best checkpoint to save disk
-        fp16=USE_FP16 and torch.cuda.is_available(),
+        bf16=USE_BF16 and torch.cuda.is_available(),
         dataloader_num_workers=NUM_WORKERS,
         seed=RANDOM_SEED,
         report_to="wandb" if USE_WANDB else "none",
