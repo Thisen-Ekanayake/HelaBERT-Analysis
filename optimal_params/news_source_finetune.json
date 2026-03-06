@@ -1,0 +1,9 @@
+{
+  "learning_rate": 1.1665855829846415e-05,
+  "weight_decay": 0.09903905657509242,
+  "warmup_ratio": 0.061588181337592085,
+  "batch_size": 32,
+  "dropout": 0.2,
+  "best_optuna_score": 0.25556583557295726,
+  "n_trials_run": 40
+}

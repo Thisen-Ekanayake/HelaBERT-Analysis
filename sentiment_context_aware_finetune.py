@@ -30,11 +30,14 @@ Architecture:
 """
 
 import os
+import json
 import smtplib
 import traceback
 import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 import math
 import numpy as np
 import pandas as pd
@@ -52,7 +55,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from transformers import (
     BertConfig, BertModel, BertForMaskedLM,
-    Trainer, TrainingArguments, EvalPrediction
+    Trainer, TrainerCallback, TrainingArguments, EvalPrediction
 )
 from transformers.modeling_outputs import SequenceClassifierOutput
 import random
@@ -76,8 +79,13 @@ EMAIL_SMTP_PORT   = int(os.getenv("EMAIL_SMTP_PORT", "587"))
 TRAINING_JOB_NAME = os.getenv("TRAINING_sentiment_context", "BERT Fine-tuning")
 
 
-def send_email_notification(subject: str, body_html: str, body_text: str = None):
-    """Send an email notification. Silently skips if email is not configured."""
+def send_email_notification(subject: str, body_html: str, body_text: str = None,
+                            attachments: list = None):
+    """Send an email notification. Silently skips if email is not configured.
+
+    Args:
+        attachments: Optional list of file paths to attach to the email.
+    """
     if not EMAIL_NOTIFICATIONS_ENABLED:
         print("ℹ️  Email notifications disabled (EMAIL_NOTIFICATIONS_ENABLED=false)")
         return
@@ -86,13 +94,33 @@ def send_email_notification(subject: str, body_html: str, body_text: str = None)
               "or EMAIL_RECIPIENT not set in .env")
         return
     try:
-        msg = MIMEMultipart("alternative")
+        msg = MIMEMultipart("mixed")
         msg["Subject"] = subject
         msg["From"]    = EMAIL_SENDER
         msg["To"]      = EMAIL_RECIPIENT
+
+        # Build the alternative (text/html) part
+        alt_part = MIMEMultipart("alternative")
         if body_text:
-            msg.attach(MIMEText(body_text, "plain"))
-        msg.attach(MIMEText(body_html, "html"))
+            alt_part.attach(MIMEText(body_text, "plain"))
+        alt_part.attach(MIMEText(body_html, "html"))
+        msg.attach(alt_part)
+
+        # Attach files if provided
+        if attachments:
+            for filepath in attachments:
+                if os.path.exists(filepath):
+                    with open(filepath, "rb") as f:
+                        part = MIMEBase("application", "octet-stream")
+                        part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    filename = os.path.basename(filepath)
+                    part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+                    msg.attach(part)
+                    print(f"📎  Attached: {filename}")
+                else:
+                    print(f"⚠️  Attachment not found, skipping: {filepath}")
+
         with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT) as server:
             server.ehlo()
             server.starttls()
@@ -103,11 +131,16 @@ def send_email_notification(subject: str, body_html: str, body_text: str = None)
         print(f"⚠️  Failed to send email notification: {e}")
 
 
-def _build_success_email(summary: dict, wandb_url: str = None) -> tuple:
+def _build_success_email(summary: dict, wandb_url: str = None,
+                         epoch_log_path: str = None) -> tuple:
     timestamp    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     wandb_section = (
         f'<p>📊 <a href="{wandb_url}">View full W&amp;B dashboard</a></p>'
         if wandb_url else ""
+    )
+    log_section = (
+        f'<p>📎 Per-epoch training log attached: <b>{os.path.basename(epoch_log_path)}</b></p>'
+        if epoch_log_path and os.path.exists(epoch_log_path) else ""
     )
     metric_rows = "".join(
         f"<tr><td style='padding:4px 12px'>{k}</td>"
@@ -130,6 +163,7 @@ def _build_success_email(summary: dict, wandb_url: str = None) -> tuple:
         </tr>
         {metric_rows}
       </table>
+      {log_section}
       {wandb_section}
       <p style='color:#888;font-size:12px'>Sent automatically by training script</p>
     </body></html>
@@ -142,6 +176,8 @@ def _build_success_email(summary: dict, wandb_url: str = None) -> tuple:
             f"{k}: {(f'{v:.4f}' if isinstance(v, float) else str(v))}"
             for k, v in summary.items()
         )
+        + (f"\n\nPer-epoch log attached: {os.path.basename(epoch_log_path)}"
+           if epoch_log_path and os.path.exists(epoch_log_path) else "")
         + (f"\n\nW&B: {wandb_url}" if wandb_url else "")
     )
     subject = f"✅ Training Complete — {TRAINING_JOB_NAME}"
@@ -204,18 +240,43 @@ MAX_CHUNKS   = 16     # cap per article — reduce to 8 if OOM
 COMMENT_MAX_LENGTH = 256
 
 # ── Cross-attention ────────────────────────────────────────────────────────────
-CROSS_ATTN_HEADS   = 8     # must divide hidden_size (768/8 = 96 per head)
-CROSS_ATTN_DROPOUT = 0.1
+CROSS_ATTN_HEADS = 8     # must divide hidden_size (768/8 = 96 per head)
 
-# ── Training ───────────────────────────────────────────────────────────────────
-TRAIN_BATCH_SIZE            = 8     # lower: MAX_CHUNKS+1 BERT passes per sample
-EVAL_BATCH_SIZE             = 8
-LEARNING_RATE               = 1e-5
-NUM_EPOCHS                  = 10
-WARMUP_RATIO                = 0.1
-WEIGHT_DECAY                = 0.05
-GRADIENT_ACCUMULATION_STEPS = 8     # effective batch = 64
+# ==================== LOAD OPTUNA HYPERPARAMETERS ====================
+OPTUNA_PARAMS_FILE = "optimal_params/sentiment_context_aware_finetune.json"
+
+_optuna_params = {}
+if os.path.exists(OPTUNA_PARAMS_FILE):
+    with open(OPTUNA_PARAMS_FILE, "r") as _f:
+        _optuna_params = json.load(_f)
+    print(f"\n✓ Loaded Optuna hyperparameters from: {OPTUNA_PARAMS_FILE}")
+    for _k, _v in _optuna_params.items():
+        print(f"  - {_k}: {_v}")
+else:
+    print(f"\n⚠️  Optuna params file not found ({OPTUNA_PARAMS_FILE}) — using defaults")
+
+# ── Training hyperparameters — sourced from Optuna JSON where available ────────
+NUM_EPOCHS                  = 20    # train for 20 epochs
+GRADIENT_ACCUMULATION_STEPS = 8    # effective batch = batch_size * 8
 VAL_SPLIT                   = 0.1
+
+LEARNING_RATE      = _optuna_params.get("learning_rate", 4.628207112754806e-05)
+WEIGHT_DECAY       = _optuna_params.get("weight_decay",  0.02794737344640999)
+WARMUP_RATIO       = _optuna_params.get("warmup_ratio",  0.10738204067095455)
+TRAIN_BATCH_SIZE   = int(_optuna_params.get("batch_size", 16))
+EVAL_BATCH_SIZE    = TRAIN_BATCH_SIZE
+# Dropout used for: cross-attention module AND fusion head
+CLASSIFIER_DROPOUT = _optuna_params.get("dropout", 0.3)
+CROSS_ATTN_DROPOUT = CLASSIFIER_DROPOUT
+
+print(f"\n✓ Effective training hyperparameters:")
+print(f"  - learning_rate:              {LEARNING_RATE}")
+print(f"  - weight_decay:               {WEIGHT_DECAY}")
+print(f"  - warmup_ratio:               {WARMUP_RATIO}")
+print(f"  - batch_size:                 {TRAIN_BATCH_SIZE}")
+print(f"  - dropout (cross-attn+fusion):{CLASSIFIER_DROPOUT}")
+print(f"  - num_epochs:                 {NUM_EPOCHS}")
+print(f"  - effective_batch:            {TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
 
 # ── Output ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = "HelaBERT_sentiment_crossattn"
@@ -530,14 +591,15 @@ class CrossAttnSentimentModel(nn.Module):
     article passage carry similar or opposing signals.
     """
 
-    def __init__(self, bert, hidden_size, num_labels, num_heads, attn_dropout):
+    def __init__(self, bert, hidden_size, num_labels, num_heads, attn_dropout,
+                 fusion_dropout=0.1):
         super().__init__()
         self.bert        = bert
         self.hidden_size = hidden_size
         self.cross_attn  = MultiHeadCrossAttention(hidden_size, num_heads, attn_dropout)
         # Fusion dim = 3 * H
         self.fusion_norm = nn.LayerNorm(hidden_size * 3)
-        self.dropout     = nn.Dropout(0.1)
+        self.dropout     = nn.Dropout(fusion_dropout)
         self.classifier  = nn.Linear(hidden_size * 3, num_labels)
 
     def encode_chunks(self, chunk_ids, chunk_mask, num_chunks):
@@ -628,7 +690,8 @@ model = CrossAttnSentimentModel(
     hidden_size=hidden_size,
     num_labels=NUM_LABELS,
     num_heads=CROSS_ATTN_HEADS,
-    attn_dropout=CROSS_ATTN_DROPOUT
+    attn_dropout=CROSS_ATTN_DROPOUT,
+    fusion_dropout=CLASSIFIER_DROPOUT,
 )
 
 total     = sum(p.numel() for p in model.parameters())
@@ -684,6 +747,63 @@ def compute_metrics(eval_pred: EvalPrediction):
         'f1':          f1_score(labels, preds,        average='macro',    zero_division=0),
         'f1_weighted': f1_score(labels, preds,        average='weighted', zero_division=0),
     }
+
+print("✓ Metrics: accuracy, precision, recall, macro-F1, weighted-F1")
+
+
+# ==================== EPOCH LOGGER CALLBACK ====================
+
+class EpochLoggerCallback(TrainerCallback):
+    """Captures per-epoch train loss, eval loss, and all eval metrics into a list."""
+
+    def __init__(self):
+        self.epoch_logs: list = []
+        self._pending_train_loss: float = None
+        self._step_losses: list = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Collect step-level training loss."""
+        if logs and "loss" in logs:
+            self._step_losses.append(logs["loss"])
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        """Average step losses into a per-epoch train loss."""
+        if self._step_losses:
+            self._pending_train_loss = float(np.mean(self._step_losses))
+            self._step_losses = []
+        else:
+            self._pending_train_loss = None
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        """Merge eval metrics with the latest train loss and store the record."""
+        if metrics is None:
+            return
+
+        epoch_num = int(round(state.epoch)) if state.epoch is not None else len(self.epoch_logs) + 1
+        record = {"epoch": epoch_num}
+
+        if self._pending_train_loss is not None:
+            record["train_loss"] = self._pending_train_loss
+            self._pending_train_loss = None
+
+        for key, value in metrics.items():
+            record[f"eval_{key.replace('eval_', '')}"] = value
+
+        self.epoch_logs.append(record)
+
+        # Live summary line
+        parts = [f"Epoch {epoch_num:>3}"]
+        if "train_loss" in record:
+            parts.append(f"train_loss={record['train_loss']:.4f}")
+        for k in ("eval_loss", "eval_accuracy", "eval_f1", "eval_f1_weighted",
+                  "eval_precision", "eval_recall"):
+            if k in record:
+                parts.append(f"{k}={record[k]:.4f}")
+        print("  📊 " + " | ".join(parts))
+
+
+epoch_logger = EpochLoggerCallback()
+print("✓ EpochLoggerCallback defined")
 
 
 # ==================== W&B ====================
@@ -771,6 +891,7 @@ trainer = CrossAttnTrainer(
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
     compute_metrics=compute_metrics,
+    callbacks=[epoch_logger],
 )
 
 approx_steps = (len(tr_df) * NUM_EPOCHS
@@ -818,6 +939,73 @@ except Exception as e:
     _subj, _html, _plain = _build_failure_email(e, tb_str)
     send_email_notification(_subj, _html, _plain)
     raise
+
+
+# ==================== SAVE EPOCH LOG ====================
+print("\n" + "=" * 80)
+print("SAVING PER-EPOCH TRAINING LOG")
+print("=" * 80)
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+_timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+EPOCH_LOG_PATH = f"{OUTPUT_DIR}/epoch_training_log_{_timestamp_str}.json"
+
+epoch_log_payload = {
+    "job":          TRAINING_JOB_NAME,
+    "stage":        STAGE_TAG,
+    "model":        BERT_MODEL_PATH,
+    "train_data":   TRAIN_DATA_PATH,
+    "test_data":    TEST_DATA_PATH,
+    "architecture": {
+        "cross_attn_heads":    CROSS_ATTN_HEADS,
+        "cross_attn_dropout":  CROSS_ATTN_DROPOUT,
+        "fusion_dropout":      CLASSIFIER_DROPOUT,
+        "chunk_size":          CHUNK_SIZE,
+        "chunk_stride":        CHUNK_STRIDE,
+        "max_chunks":          MAX_CHUNKS,
+        "comment_max_length":  COMMENT_MAX_LENGTH,
+    },
+    "hyperparameters": {
+        "learning_rate":              LEARNING_RATE,
+        "weight_decay":               WEIGHT_DECAY,
+        "warmup_ratio":               WARMUP_RATIO,
+        "batch_size":                 TRAIN_BATCH_SIZE,
+        "dropout":                    CLASSIFIER_DROPOUT,
+        "num_epochs":                 NUM_EPOCHS,
+        "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+        "effective_batch_size":       TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
+        "val_split":                  VAL_SPLIT,
+    },
+    "optuna_source":     _optuna_params,
+    "completed_at":      datetime.datetime.now().isoformat(),
+    "num_train_samples": len(tr_df),
+    "num_val_samples":   len(val_df),
+    "num_test_samples":  len(test_df),
+    "label_names":       list(le.classes_),
+    "per_epoch_logs":    epoch_logger.epoch_logs,
+}
+
+with open(EPOCH_LOG_PATH, "w") as _f:
+    json.dump(epoch_log_payload, _f, indent=2)
+
+print(f"✓ Per-epoch log saved to: {EPOCH_LOG_PATH}")
+print(f"\nEpoch summary table:")
+print(f"  {'Epoch':>5} | {'Train Loss':>10} | {'Eval Loss':>9} | "
+      f"{'Accuracy':>8} | {'F1 Macro':>8} | {'F1 Weighted':>11}")
+print("  " + "-" * 68)
+for rec in epoch_logger.epoch_logs:
+    print(
+        f"  {rec.get('epoch', '?'):>5} | "
+        f"{rec.get('train_loss',        float('nan')):>10.4f} | "
+        f"{rec.get('eval_loss',         float('nan')):>9.4f} | "
+        f"{rec.get('eval_accuracy',     float('nan')):>8.4f} | "
+        f"{rec.get('eval_f1',           float('nan')):>8.4f} | "
+        f"{rec.get('eval_f1_weighted',  float('nan')):>11.4f}"
+    )
+
+if USE_WANDB:
+    wandb.save(EPOCH_LOG_PATH)
+    print("✓ Epoch log uploaded to W&B artifacts")
 
 
 # ==================== SAVE MODEL ====================
@@ -1116,7 +1304,8 @@ else:
 print("\n" + "=" * 80)
 print("SENDING COMPLETION NOTIFICATION")
 print("=" * 80)
-_subj, _html, _plain = _build_success_email(test_metrics, _wandb_url)
-send_email_notification(_subj, _html, _plain)
+_subj, _html, _plain = _build_success_email(test_metrics, _wandb_url,
+                                             epoch_log_path=EPOCH_LOG_PATH)
+send_email_notification(_subj, _html, _plain, attachments=[EPOCH_LOG_PATH])
 
 print("\n" + "=" * 80)
