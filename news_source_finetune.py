@@ -137,7 +137,7 @@ else:
 df = df.drop(columns=[c for c in df.columns if 'Unnamed' in c], errors='ignore')
 df = df.dropna()
 df['comment'] = df['comment'].astype(str).str.strip()
-df['label']   = df['label'].astype(str).str.strip().astype(int)
+df['label']   = df['label'].astype(str).str.strip().astype(float).astype(int)
 
 actual_num_labels = df['label'].nunique()
 if actual_num_labels != NUM_LABELS:
