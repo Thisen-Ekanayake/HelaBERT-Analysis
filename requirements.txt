@@ -37,3 +37,7 @@ bert-score
 # Visualization
 matplotlib
 seaborn
+
+ray[tune]==2.44.1
+optuna==4.3.0
+scikit-learn==1.8.0
