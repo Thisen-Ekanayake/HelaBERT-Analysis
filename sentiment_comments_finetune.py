@@ -1,5 +1,6 @@
 """
 BERT Fine-tuning for Sentiment Analysis — Comments Only (Baseline)
+— Balanced training via oversampling + weighted loss (Option 3) —
 
 Pipeline:
   Stage 1 (this script): Fine-tune using ONLY the comment text → baseline model
@@ -18,11 +19,15 @@ import os
 import smtplib
 import traceback
 import datetime
+from collections import Counter
+import random as stdlib_random
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset
 import sentencepiece as spm
 from sklearn.preprocessing import LabelEncoder
@@ -43,16 +48,16 @@ from transformers import (
     BertModel,
     Trainer,
     TrainingArguments,
-    EvalPrediction
+    EvalPrediction,
+    EarlyStoppingCallback,
 )
 import random
 import wandb
 from dotenv import load_dotenv
 
 
-
 # ==================== LOAD ENVIRONMENT VARIABLES ====================
-load_dotenv()  # Loads variables from .env file into os.environ
+load_dotenv()
 
 
 # ==================== EMAIL NOTIFICATION SETUP ====================
@@ -63,7 +68,8 @@ EMAIL_PASSWORD    = os.getenv("EMAIL_APP_PASSWORD")
 EMAIL_RECIPIENT   = os.getenv("EMAIL_RECIPIENT")
 EMAIL_SMTP_HOST   = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
 EMAIL_SMTP_PORT   = int(os.getenv("EMAIL_SMTP_PORT", "587"))
-TRAINING_JOB_NAME = os.getenv("TRAINING_sentiment_comments", "BERT Fine-tuning")
+TRAINING_JOB_NAME = os.getenv("TRAINING_sentiment_comments",
+                               "BERT Sentiment Comments Fine-tuning (Balanced)")
 
 
 def send_email_notification(subject: str, body_html: str, body_text: str = None):
@@ -94,7 +100,7 @@ def send_email_notification(subject: str, body_html: str, body_text: str = None)
 
 
 def _build_success_email(summary: dict, wandb_url: str = None) -> tuple:
-    timestamp    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp     = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     wandb_section = (
         f'<p>📊 <a href="{wandb_url}">View full W&amp;B dashboard</a></p>'
         if wandb_url else ""
@@ -121,7 +127,7 @@ def _build_success_email(summary: dict, wandb_url: str = None) -> tuple:
         {metric_rows}
       </table>
       {wandb_section}
-      <p style='color:#888;font-size:12px'>Sent automatically by training script</p>
+      <p style='color:#888;font-size:12px'>Sent by sentiment_comments_finetune_balanced.py</p>
     </body></html>
     """
     plain = (
@@ -151,7 +157,7 @@ def _build_failure_email(error: Exception, tb_str: str) -> tuple:
       <p><b>Error:</b> <span style='color:#c62828'>{error_type}: {error_msg}</span></p>
       <h3>Traceback</h3>
       <pre style='background:#f5f5f5;padding:12px;font-size:12px;overflow:auto'>{tb_escaped}</pre>
-      <p style='color:#888;font-size:12px'>Sent automatically by training script</p>
+      <p style='color:#888;font-size:12px'>Sent by sentiment_comments_finetune_balanced.py</p>
     </body></html>
     """
     plain = (
@@ -164,42 +170,48 @@ def _build_failure_email(error: Exception, tb_str: str) -> tuple:
     subject = f"❌ Training Crashed — {TRAINING_JOB_NAME}"
     return subject, html, plain
 
+
 # ==================== CONFIGURATION ====================
 print("=" * 80)
-print("BERT SENTIMENT ANALYSIS — STAGE 1: COMMENTS ONLY (BASELINE)")
+print("BERT SENTIMENT ANALYSIS — STAGE 1: COMMENTS ONLY  [BALANCED — OPTION 3]")
 print("=" * 80)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-BERT_MODEL_PATH  = "HelaBERT"                               # ← pretrained BERT
-TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"  # SentencePiece
+BERT_MODEL_PATH  = "HelaBERT"
+TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT/config.json"
 
-TRAIN_DATA_PATH  = "data/sinhala-sentiment-analysis/train.tsv"              # ← CHANGE: train TSV
-TEST_DATA_PATH   = "data/sinhala-sentiment-analysis/test.tsv"               # ← CHANGE: test  TSV
+TRAIN_DATA_PATH = "data/sinhala-sentiment-analysis/train.tsv"
+TEST_DATA_PATH  = "data/sinhala-sentiment-analysis/test.tsv"
 
-# ── TSV column names (change if your file uses different headers) ──────────────
-COMMENT_COL   = "comment_phrase"
-LABEL_COL     = "comment_sentiment"
+# ── TSV column names ───────────────────────────────────────────────────────────
+COMMENT_COL = "comment_phrase"
+LABEL_COL   = "comment_sentiment"
 
 # ── Training hyperparameters ───────────────────────────────────────────────────
-MAX_LENGTH                  = 256   # max tokens per comment
-TRAIN_BATCH_SIZE            = 16
-EVAL_BATCH_SIZE             = 64
-LEARNING_RATE               = 5e-6
-NUM_EPOCHS                  = 1
-WARMUP_RATIO                = 0.1
-WEIGHT_DECAY                = 0.05
-GRADIENT_ACCUMULATION_STEPS = 1
-VAL_SPLIT                   = 0.1   # fraction of train set used for validation
+MAX_LENGTH                   = 256   # max tokens per comment — kept as-is
+TRAIN_BATCH_SIZE             = 16    # unchanged (was already 16)
+EVAL_BATCH_SIZE              = 16    # reduced from 64 for consistency
+LEARNING_RATE                = 3e-5  # increased from 5e-6
+NUM_EPOCHS                   = 20    # early stopping decides actual stop point
+WARMUP_RATIO                 = 0.06  # reduced from 0.1
+WEIGHT_DECAY                 = 0.01  # reduced from 0.05
+GRADIENT_ACCUMULATION_STEPS  = 2     # effective batch = 32; was 1
+VAL_SPLIT                    = 0.1   # fraction of train set used for validation
+EARLY_STOPPING_PATIENCE      = 3
+
+# ── Balancing ──────────────────────────────────────────────────────────────────
+OVERSAMPLE_TRAIN  = True
+USE_CLASS_WEIGHTS = True
 
 # ── Output ─────────────────────────────────────────────────────────────────────
-OUTPUT_DIR        = "HelaBERT_sentiment_comments_only"
-STAGE_TAG         = "comments_only"   # used in W&B run name & saved files
+OUTPUT_DIR = "HelaBERT_sentiment_comments_only_balanced"
+STAGE_TAG  = "comments_only_balanced"
 
 # ── Misc ───────────────────────────────────────────────────────────────────────
-RANDOM_SEED  = 42
-USE_FP16     = True
-NUM_WORKERS  = 2
+RANDOM_SEED = 42
+USE_FP16    = True
+NUM_WORKERS = 2
 
 # ── Weights & Biases ───────────────────────────────────────────────────────────
 USE_WANDB         = True
@@ -215,11 +227,14 @@ print(f"  - Train data:       {TRAIN_DATA_PATH}")
 print(f"  - Test data:        {TEST_DATA_PATH}")
 print(f"  - Output directory: {OUTPUT_DIR}")
 print(f"  - Stage:            {STAGE_TAG}")
+print(f"  - Oversampling:     {'Enabled' if OVERSAMPLE_TRAIN else 'Disabled'}")
+print(f"  - Class weights:    {'Enabled' if USE_CLASS_WEIGHTS else 'Disabled'}")
 print(f"  - W&B logging:      {'Enabled' if USE_WANDB else 'Disabled'}")
 
 
 # ==================== RANDOM SEEDS ====================
 random.seed(RANDOM_SEED)
+stdlib_random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 if torch.cuda.is_available():
@@ -244,10 +259,10 @@ else:
 print("\n" + "=" * 80)
 print("VERIFYING PATHS")
 print("=" * 80)
-assert os.path.exists(BERT_MODEL_PATH),  f"❌ Model not found: {BERT_MODEL_PATH}"
-assert os.path.exists(TOKENIZER_MODEL),  f"❌ Tokenizer not found: {TOKENIZER_MODEL}"
-assert os.path.exists(TRAIN_DATA_PATH),  f"❌ Train file not found: {TRAIN_DATA_PATH}"
-assert os.path.exists(TEST_DATA_PATH),   f"❌ Test file not found: {TEST_DATA_PATH}"
+assert os.path.exists(BERT_MODEL_PATH), f"❌ Model not found: {BERT_MODEL_PATH}"
+assert os.path.exists(TOKENIZER_MODEL), f"❌ Tokenizer not found: {TOKENIZER_MODEL}"
+assert os.path.exists(TRAIN_DATA_PATH), f"❌ Train file not found: {TRAIN_DATA_PATH}"
+assert os.path.exists(TEST_DATA_PATH),  f"❌ Test file not found: {TEST_DATA_PATH}"
 print("✓ All paths verified")
 
 
@@ -272,7 +287,6 @@ def load_tsv(path: str, comment_col: str, label_col: str) -> pd.DataFrame:
 
     df.columns = df.columns.str.strip()
 
-    # Flexible column detection — accept exact name or fuzzy match
     def find_col(df, preferred):
         if preferred in df.columns:
             return preferred
@@ -309,7 +323,7 @@ print("\n" + "=" * 80)
 print("ENCODING LABELS")
 print("=" * 80)
 
-# Fit encoder on ALL labels (train + test) so IDs are consistent
+# Fit encoder on ALL labels (train + test) so IDs are consistent across stages
 all_labels = pd.concat([train_df['label'], test_df['label']]).unique()
 le = LabelEncoder()
 le.fit(sorted(all_labels))   # sorted for determinism
@@ -321,16 +335,15 @@ NUM_LABELS  = len(le.classes_)
 id_to_label = {i: lbl for i, lbl in enumerate(le.classes_)}
 label_to_id = {lbl: i for i, lbl in id_to_label.items()}
 
-# Save mapping
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-mapping_df = pd.DataFrame({'label_id': list(id_to_label.keys()),
+mapping_df = pd.DataFrame({'label_id':   list(id_to_label.keys()),
                             'label_name': list(id_to_label.values())})
 mapping_df.to_csv(f"{OUTPUT_DIR}/label_mapping.csv", index=False)
 
 print(f"✓ {NUM_LABELS} unique sentiment labels detected:")
 for idx, lbl in sorted(id_to_label.items()):
-    tr  = (train_df['label_id'] == idx).sum()
-    te  = (test_df['label_id']  == idx).sum()
+    tr = (train_df['label_id'] == idx).sum()
+    te = (test_df['label_id']  == idx).sum()
     print(f"  [{idx}] {lbl:20s}  train: {tr:5d}  test: {te:5d}")
 print(f"\n✓ Label mapping saved to {OUTPUT_DIR}/label_mapping.csv")
 
@@ -350,12 +363,80 @@ tr_texts, val_texts, tr_labels, val_labels = train_test_split(
     stratify=train_labels
 )
 
-print(f"  Train    : {len(tr_texts):,}")
-print(f"  Val      : {len(val_texts):,}")
-print(f"  Test     : {len(test_df):,}  (held-out, not used during training)")
+print(f"  Train (before balancing): {len(tr_texts):,}")
+print(f"  Val                     : {len(val_texts):,}")
+print(f"  Test (held-out)         : {len(test_df):,}  (never touched during training)")
 
 test_comments = test_df['comment'].tolist()
 test_labels   = test_df['label_id'].tolist()
+
+print("\n  Train label distribution (before balancing):")
+for idx, cnt in sorted(Counter(tr_labels).items()):
+    print(f"    [{idx}] {id_to_label[idx]:20s}: {cnt}")
+
+
+# ==================== OVERSAMPLING ====================
+print("\n" + "=" * 80)
+print("BALANCING TRAINING DATA (OVERSAMPLING)")
+print("=" * 80)
+
+
+def oversample(texts, labels, seed=42):
+    """
+    Oversample minority classes so every class matches the majority class count.
+    Applied ONLY to the training split — val and test sets are never touched.
+    """
+    stdlib_random.seed(seed)
+    counts    = Counter(labels)
+    max_count = max(counts.values())
+
+    balanced_texts  = list(texts)
+    balanced_labels = list(labels)
+
+    for label, count in counts.items():
+        needed  = max_count - count
+        if needed == 0:
+            continue
+        indices = [i for i, l in enumerate(labels) if l == label]
+        extras  = stdlib_random.choices(indices, k=needed)
+        balanced_texts  += [texts[i]  for i in extras]
+        balanced_labels += [labels[i] for i in extras]
+
+    combined = list(zip(balanced_texts, balanced_labels))
+    stdlib_random.shuffle(combined)
+    balanced_texts, balanced_labels = zip(*combined)
+    return list(balanced_texts), list(balanced_labels)
+
+
+if OVERSAMPLE_TRAIN:
+    original_train_size = len(tr_texts)
+    tr_texts, tr_labels = oversample(tr_texts, tr_labels, seed=RANDOM_SEED)
+
+    print(f"✓ Oversampling complete")
+    print(f"  - Before: {original_train_size:,} samples")
+    print(f"  - After:  {len(tr_texts):,} samples")
+    print(f"\n  Train label distribution (after oversampling):")
+    for idx, cnt in sorted(Counter(tr_labels).items()):
+        print(f"    [{idx}] {id_to_label[idx]:20s}: {cnt}")
+else:
+    print("⚠️  Oversampling disabled — using original distribution")
+
+
+# ==================== CLASS WEIGHTS ====================
+print("\n" + "=" * 80)
+print("COMPUTING CLASS WEIGHTS")
+print("=" * 80)
+
+# Compute from the original (pre-oversample) train split so minority classes
+# still receive a signal boost even after balancing
+original_tr_counts = Counter(train_labels)   # full train_df label_id counts
+class_weights_list = [1.0 / original_tr_counts.get(i, 1) for i in range(NUM_LABELS)]
+weights_tensor     = torch.tensor(class_weights_list, dtype=torch.float)
+weights_tensor     = weights_tensor / weights_tensor.sum() * NUM_LABELS
+
+print("Class weights (based on original training distribution):")
+for i, w in enumerate(weights_tensor):
+    print(f"  [{i}] {id_to_label[i]:20s}: {w.item():.4f}")
 
 
 # ==================== DATASET CLASS ====================
@@ -385,9 +466,9 @@ class CommentDataset(Dataset):
         mask += [0] * pad
 
         return {
-            'input_ids':      torch.tensor(ids,             dtype=torch.long),
-            'attention_mask': torch.tensor(mask,            dtype=torch.long),
-            'labels':         torch.tensor(self.labels[idx], dtype=torch.long)
+            'input_ids':      torch.tensor(ids,              dtype=torch.long),
+            'attention_mask': torch.tensor(mask,             dtype=torch.long),
+            'labels':         torch.tensor(self.labels[idx], dtype=torch.long),
         }
 
 
@@ -396,8 +477,8 @@ val_dataset   = CommentDataset(val_texts,       val_labels,  sp, MAX_LENGTH)
 test_dataset  = CommentDataset(test_comments,   test_labels, sp, MAX_LENGTH)
 
 print(f"✓ train_dataset : {len(train_dataset):,} samples")
-print(f"✓ val_dataset   : {len(val_dataset):,}   samples")
-print(f"✓ test_dataset  : {len(test_dataset):,}  samples")
+print(f"✓ val_dataset   : {len(val_dataset):,} samples")
+print(f"✓ test_dataset  : {len(test_dataset):,} samples")
 
 sample = train_dataset[0]
 print(f"\nSample check:")
@@ -412,7 +493,6 @@ print("\n" + "=" * 80)
 print("LOADING MODEL")
 print("=" * 80)
 
-# Load config
 if os.path.exists(BERT_CONFIG_FILE):
     config = BertConfig.from_json_file(BERT_CONFIG_FILE)
     print(f"✓ Config loaded from: {BERT_CONFIG_FILE}")
@@ -425,17 +505,19 @@ else:
         print("⚠️  Config not found — will infer from model")
 
 if config:
-    config.num_labels = NUM_LABELS
+    config.num_labels          = NUM_LABELS
+    config.hidden_dropout_prob = 0.2   # increased from default 0.1
+                                       # counters duplicate memorisation from oversampling
     print(f"  hidden_size: {config.hidden_size}  |  layers: {config.num_hidden_layers}"
-          f"  |  heads: {config.num_attention_heads}  |  num_labels: {config.num_labels}")
+          f"  |  heads: {config.num_attention_heads}  |  num_labels: {config.num_labels}"
+          f"  |  dropout: {config.hidden_dropout_prob}")
 
-print(f"\nLoading weights from: {BERT_MODEL_PATH}")
 
-def load_bert_for_classification(model_path, config):
+def load_bert_for_classification(model_path, cfg):
     """Try BertModel → BertForMaskedLM → raise."""
     try:
-        base   = BertModel.from_pretrained(model_path)
-        model  = BertForSequenceClassification(config)
+        base  = BertModel.from_pretrained(model_path)
+        model = BertForSequenceClassification(cfg)
         base_s = base.state_dict()
         mod_s  = model.state_dict()
         for name, param in base_s.items():
@@ -447,11 +529,12 @@ def load_bert_for_classification(model_path, config):
     except Exception as e:
         print(f"  BertModel load failed ({e}), trying MLM checkpoint...")
 
-    mlm   = BertForMaskedLM.from_pretrained(model_path)
-    if config is None:
-        config = mlm.config
-        config.num_labels = NUM_LABELS
-    model = BertForSequenceClassification(config)
+    mlm = BertForMaskedLM.from_pretrained(model_path)
+    if cfg is None:
+        cfg = mlm.config
+        cfg.num_labels          = NUM_LABELS
+        cfg.hidden_dropout_prob = 0.2
+    model = BertForSequenceClassification(cfg)
     mlm_s = mlm.state_dict()
     mod_s = model.state_dict()
     for name, param in mlm_s.items():
@@ -461,6 +544,8 @@ def load_bert_for_classification(model_path, config):
     print("✓ Weights loaded via BertForMaskedLM")
     return model
 
+
+print(f"\nLoading weights from: {BERT_MODEL_PATH}")
 model = load_bert_for_classification(BERT_MODEL_PATH, config)
 
 total     = sum(p.numel() for p in model.parameters())
@@ -481,13 +566,47 @@ def compute_metrics(eval_pred: EvalPrediction):
     return {
         'accuracy':    accuracy_score(labels, preds),
         'precision':   precision_score(labels, preds, average='macro',    zero_division=0),
-        'recall':      recall_score(labels, preds,    average='macro',    zero_division=0),
-        'f1':          f1_score(labels, preds,        average='macro',    zero_division=0),
-        'f1_weighted': f1_score(labels, preds,        average='weighted', zero_division=0),
+        'recall':      recall_score(labels,    preds, average='macro',    zero_division=0),
+        'f1':          f1_score(labels,        preds, average='macro',    zero_division=0),
+        'f1_weighted': f1_score(labels,        preds, average='weighted', zero_division=0),
     }
 
 
 print("✓ Metrics: accuracy, precision, recall, macro-F1, weighted-F1")
+
+
+# ==================== WEIGHTED TRAINER ====================
+print("\n" + "=" * 80)
+print("SETTING UP WEIGHTED TRAINER")
+print("=" * 80)
+
+
+class WeightedTrainer(Trainer):
+    """
+    Subclass of HuggingFace Trainer that replaces the default CrossEntropyLoss
+    with a class-weighted version. Acts as a safety net on top of oversampling.
+    """
+
+    def __init__(self, class_weights: torch.Tensor, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels  = inputs.get("labels")
+        outputs = model(**inputs)
+        logits  = outputs.get("logits")
+        loss    = nn.CrossEntropyLoss(
+            weight=self.class_weights.to(logits.device)
+        )(logits, labels)
+        return (loss, outputs) if return_outputs else loss
+
+
+if USE_CLASS_WEIGHTS:
+    print("✓ WeightedTrainer will be used with class weights:")
+    for i, w in enumerate(weights_tensor):
+        print(f"  [{i}] {id_to_label[i]:20s}: {w.item():.4f}")
+else:
+    print("⚠️  Class weights disabled — falling back to standard Trainer")
 
 
 # ==================== WEIGHTS & BIASES ====================
@@ -510,26 +629,32 @@ if USE_WANDB:
             id=wandb_run_id,
             resume="allow",
             config={
-                "stage":               STAGE_TAG,
-                "model":               BERT_MODEL_PATH,
-                "tokenizer":           "SentencePiece",
-                "vocab_size":          sp.get_piece_size(),
-                "hidden_size":         config.hidden_size         if config else "?",
-                "num_layers":          config.num_hidden_layers   if config else "?",
-                "num_attention_heads": config.num_attention_heads if config else "?",
-                "num_labels":          NUM_LABELS,
-                "label_names":         list(le.classes_),
-                "learning_rate":       LEARNING_RATE,
-                "epochs":              NUM_EPOCHS,
-                "train_batch_size":    TRAIN_BATCH_SIZE,
-                "effective_batch":     TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
-                "warmup_ratio":        WARMUP_RATIO,
-                "weight_decay":        WEIGHT_DECAY,
-                "max_length":          MAX_LENGTH,
-                "fp16":                USE_FP16 and torch.cuda.is_available(),
-                "train_samples":       len(tr_texts),
-                "val_samples":         len(val_texts),
-                "test_samples":        len(test_comments),
+                "stage":                   STAGE_TAG,
+                "balancing_strategy":      "oversample+class_weights",
+                "model":                   BERT_MODEL_PATH,
+                "tokenizer":               "SentencePiece",
+                "vocab_size":              sp.get_piece_size(),
+                "hidden_size":             config.hidden_size         if config else "?",
+                "num_layers":              config.num_hidden_layers   if config else "?",
+                "num_attention_heads":     config.num_attention_heads if config else "?",
+                "hidden_dropout_prob":     config.hidden_dropout_prob if config else 0.2,
+                "num_labels":              NUM_LABELS,
+                "label_names":             list(le.classes_),
+                "learning_rate":           LEARNING_RATE,
+                "epochs":                  NUM_EPOCHS,
+                "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+                "train_batch_size":        TRAIN_BATCH_SIZE,
+                "effective_batch":         TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
+                "warmup_ratio":            WARMUP_RATIO,
+                "weight_decay":            WEIGHT_DECAY,
+                "max_length":              MAX_LENGTH,
+                "fp16":                    USE_FP16 and torch.cuda.is_available(),
+                "original_train_samples":  len(tr_texts) if not OVERSAMPLE_TRAIN else original_train_size,
+                "balanced_train_samples":  len(tr_texts),
+                "val_samples":             len(val_texts),
+                "test_samples":            len(test_comments),
+                **{f"class_weight_{id_to_label[i]}": weights_tensor[i].item()
+                   for i in range(NUM_LABELS)},
             }
         )
         with open(WANDB_RUN_ID_FILE, 'w') as f:
@@ -537,8 +662,9 @@ if USE_WANDB:
         print(f"✓ W&B run ID: {run.id}")
         print(f"✓ Dashboard : {run.get_url()}")
         wandb.log({
-            "train_label_dist": wandb.Histogram(tr_labels),
-            "val_label_dist":   wandb.Histogram(val_labels),
+            "train_label_dist_balanced": wandb.Histogram(tr_labels),
+            "val_label_dist":            wandb.Histogram(val_labels),
+            "test_label_dist":           wandb.Histogram(test_labels),
         })
 
 
@@ -566,7 +692,7 @@ training_args = TrainingArguments(
     logging_first_step=True,
 
     load_best_model_at_end=True,
-    metric_for_best_model="f1",
+    metric_for_best_model="eval_f1",   # fixed: must match the logged key
     greater_is_better=True,
     save_total_limit=3,
 
@@ -579,17 +705,34 @@ training_args = TrainingArguments(
     push_to_hub=False,
 )
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
-    compute_metrics=compute_metrics,
+early_stopping = EarlyStoppingCallback(
+    early_stopping_patience=EARLY_STOPPING_PATIENCE
 )
 
-print("✓ Trainer ready")
-print(f"  Approx optimiser steps: "
-      f"~{len(train_dataset) * NUM_EPOCHS // (TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)}")
+if USE_CLASS_WEIGHTS:
+    trainer = WeightedTrainer(
+        class_weights=weights_tensor,
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        compute_metrics=compute_metrics,
+        callbacks=[early_stopping],
+    )
+    print("✓ WeightedTrainer initialized (oversampling + class weights active)")
+else:
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        compute_metrics=compute_metrics,
+        callbacks=[early_stopping],
+    )
+    print("✓ Standard Trainer initialized (oversampling only)")
+
+print(f"  Approx steps/epoch: "
+      f"~{len(train_dataset) // (TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)}")
 
 
 # ==================== TRAINING ====================
@@ -599,6 +742,7 @@ print("=" * 80)
 print(f"Stage : {STAGE_TAG}")
 print(f"Input : comment text only")
 print(f"Labels: {', '.join(le.classes_)}")
+print(f"Early stopping patience: {EARLY_STOPPING_PATIENCE} epochs")
 if USE_WANDB:
     print(f"W&B   : {wandb.run.get_url()}")
 print()
@@ -642,7 +786,7 @@ if config:
     config.save_pretrained(final_model_path)
 mapping_df.to_csv(f"{final_model_path}/label_mapping.csv", index=False)
 print(f"✓ Model saved to: {final_model_path}")
-
+print(f"✓ Label mapping saved alongside model")
 
 
 # ==================== EVALUATE ON VALIDATION SET ====================
@@ -738,12 +882,12 @@ prec_pc, rec_pc, f1_pc, sup_pc = precision_recall_fscore_support(
 )
 
 per_class_df = pd.DataFrame({
-    'Label ID':   range(NUM_LABELS),
-    'Sentiment':  target_names,
-    'Precision':  prec_pc,
-    'Recall':     rec_pc,
-    'F1-Score':   f1_pc,
-    'Support':    sup_pc
+    'Label ID':  range(NUM_LABELS),
+    'Sentiment': target_names,
+    'Precision': prec_pc,
+    'Recall':    rec_pc,
+    'F1-Score':  f1_pc,
+    'Support':   sup_pc
 })
 print(per_class_df.to_string(index=False))
 per_class_df.to_csv(f"{OUTPUT_DIR}/per_class_metrics_test.csv", index=False)
@@ -752,8 +896,8 @@ print(f"\n✓ Saved to {OUTPUT_DIR}/per_class_metrics_test.csv")
 if USE_WANDB:
     wandb.log({"test/per_class_metrics": wandb.Table(dataframe=per_class_df)})
     for metric in ['Precision', 'Recall', 'F1-Score']:
-        data  = [[target_names[i], per_class_df.loc[i, metric]] for i in range(NUM_LABELS)]
-        tbl   = wandb.Table(data=data, columns=["Sentiment", metric])
+        data = [[target_names[i], per_class_df.loc[i, metric]] for i in range(NUM_LABELS)]
+        tbl  = wandb.Table(data=data, columns=["Sentiment", metric])
         wandb.log({f"test/per_class_{metric.lower().replace('-','_')}":
                    wandb.plot.bar(tbl, "Sentiment", metric, title=f"Per-Class {metric}")})
 
@@ -788,10 +932,10 @@ for i, idx in enumerate(correct_indices[:5]):
 if len(incorrect_indices) > 0:
     print("\n── Incorrect (showing 5) ────────────────────────────────────────────")
     for i, idx in enumerate(incorrect_indices[:5]):
-        probs       = torch.softmax(torch.tensor(test_output.predictions[idx]), dim=0)
-        confidence  = probs[y_pred[idx]].item()
-        true_conf   = probs[y_true[idx]].item()
-        preview     = test_comments[idx][:100] + "..." if len(test_comments[idx]) > 100 else test_comments[idx]
+        probs      = torch.softmax(torch.tensor(test_output.predictions[idx]), dim=0)
+        confidence = probs[y_pred[idx]].item()
+        true_conf  = probs[y_true[idx]].item()
+        preview    = test_comments[idx][:100] + "..." if len(test_comments[idx]) > 100 else test_comments[idx]
         print(f"\n{i+1}. {preview}")
         print(f"   True: {id_to_label[y_true[idx]]:15s} [{true_conf:.4f}]  "
               f"Pred: {id_to_label[y_pred[idx]]:15s} [{confidence:.4f}]")
@@ -817,13 +961,13 @@ confidences = [
 ]
 
 results_df = pd.DataFrame({
-    'comment':            test_comments,
-    'true_label_id':      y_true,
-    'true_sentiment':     [id_to_label[l] for l in y_true],
-    'predicted_label_id': y_pred,
-    'predicted_sentiment':[id_to_label[l] for l in y_pred],
-    'correct':            y_true == y_pred,
-    'confidence':         confidences
+    'comment':             test_comments,
+    'true_label_id':       y_true,
+    'true_sentiment':      [id_to_label[l] for l in y_true],
+    'predicted_label_id':  y_pred,
+    'predicted_sentiment': [id_to_label[l] for l in y_pred],
+    'correct':             y_true == y_pred,
+    'confidence':          confidences
 })
 results_df.to_csv(f"{OUTPUT_DIR}/predictions_test.csv", index=False)
 print(f"✓ Predictions saved to {OUTPUT_DIR}/predictions_test.csv")
@@ -831,28 +975,31 @@ print(f"✓ Predictions saved to {OUTPUT_DIR}/predictions_test.csv")
 
 # ==================== SUMMARY ====================
 summary = {
-    'Stage':             STAGE_TAG,
-    'Model':             'BERT with SentencePiece',
-    'Input':             'comment_phrase only',
-    'Num Classes':       NUM_LABELS,
-    'Classes':           ', '.join(le.classes_),
-    'Train Samples':     len(tr_texts),
-    'Val Samples':       len(val_texts),
-    'Test Samples':      len(test_comments),
-    'Epochs':            NUM_EPOCHS,
-    'Learning Rate':     LEARNING_RATE,
-    'Batch Size':        TRAIN_BATCH_SIZE,
-    'Max Length':        MAX_LENGTH,
+    'Stage':                  STAGE_TAG,
+    'Model':                  'BERT with SentencePiece',
+    'Balancing':              'Oversample + Class Weights',
+    'Input':                  'comment_phrase only',
+    'Num Classes':            NUM_LABELS,
+    'Classes':                ', '.join(le.classes_),
+    'Original Train Samples': original_train_size if OVERSAMPLE_TRAIN else len(tr_texts),
+    'Balanced Train Samples': len(tr_texts),
+    'Val Samples':            len(val_texts),
+    'Test Samples':           len(test_comments),
+    'Epochs':                 NUM_EPOCHS,
+    'Learning Rate':          LEARNING_RATE,
+    'Batch Size':             TRAIN_BATCH_SIZE,
+    'Effective Batch Size':   TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
+    'Max Length':             MAX_LENGTH,
     # val metrics
-    'Val Accuracy':      val_results.get('eval_accuracy',    float('nan')),
-    'Val F1 (macro)':    val_results.get('eval_f1',          float('nan')),
-    'Val F1 (weighted)': val_results.get('eval_f1_weighted', float('nan')),
+    'Val Accuracy':           val_results.get('eval_accuracy',    float('nan')),
+    'Val F1 (macro)':         val_results.get('eval_f1',          float('nan')),
+    'Val F1 (weighted)':      val_results.get('eval_f1_weighted', float('nan')),
     # test metrics
-    'Test Accuracy':     test_metrics['accuracy'],
-    'Test Precision':    test_metrics['precision'],
-    'Test Recall':       test_metrics['recall'],
-    'Test F1 (macro)':   test_metrics['f1'],
-    'Test F1 (weighted)':test_metrics['f1_weighted'],
+    'Test Accuracy':          test_metrics['accuracy'],
+    'Test Precision':         test_metrics['precision'],
+    'Test Recall':            test_metrics['recall'],
+    'Test F1 (macro)':        test_metrics['f1'],
+    'Test F1 (weighted)':     test_metrics['f1_weighted'],
 }
 
 summary_df = pd.DataFrame([summary])
@@ -866,10 +1013,10 @@ print("FINAL SUMMARY")
 print("=" * 80)
 for k, v in summary.items():
     fmt = f"{v:.4f}" if isinstance(v, float) else str(v)
-    print(f"  {k:25s}: {fmt}")
+    print(f"  {k:28s}: {fmt}")
 
 print("\n" + "=" * 80)
-print("🎉 STAGE 1 (COMMENTS ONLY) COMPLETE!")
+print("🎉 STAGE 1 (COMMENTS ONLY — BALANCED) COMPLETE!")
 print("=" * 80)
 print(f"\nOutputs in: {OUTPUT_DIR}/")
 print(f"  final_model/                  — trained model + label_mapping.csv")
