@@ -12,6 +12,7 @@ wandb/
 
 model_card.md
 *.txt
+*.png
 
 .env
 
