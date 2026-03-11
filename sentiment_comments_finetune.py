@@ -1,18 +1,19 @@
 """
-BERT Fine-tuning for Sentiment Analysis — Comments Only (Baseline)
+BERT Fine-tuning for Sentiment Analysis — Comments Only — 5-Fold Cross Validation
 — Balanced training via oversampling + weighted loss (Option 3) —
 
-Pipeline:
-  Stage 1 (this script): Fine-tune using ONLY the comment text → baseline model
-  Stage 2 (next script): Fine-tune using comment + article body → context-aware model
-  Then compare both models on the same held-out test set.
+Cross-validation strategy:
+  • StratifiedKFold(n_splits=5) preserves class distribution in every fold
+  • Oversampling applied ONLY to each fold's training split (never the val split)
+  • Class weights recomputed per fold from that fold's raw training distribution
+  • Fresh model loaded at the start of every fold
+  • Best model across all folds (highest val macro-F1) is saved as the final model
+  • Mean ± std reported across all folds at the end
+  • Separate held-out test set evaluated against the best fold model at the end
 
 TSV columns used:
   comment_phrase    → input text
   comment_sentiment → label  (e.g. POSITIVE, NEGATIVE, NEUTRAL, ...)
-
-Separate train/test TSV files are expected (no internal split needed,
-but a small validation split is carved from train for early stopping).
 """
 
 import os
@@ -31,6 +32,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 import sentencepiece as spm
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -38,9 +40,8 @@ from sklearn.metrics import (
     recall_score,
     classification_report,
     confusion_matrix,
-    precision_recall_fscore_support
+    precision_recall_fscore_support,
 )
-from sklearn.model_selection import train_test_split
 from transformers import (
     BertConfig,
     BertForSequenceClassification,
@@ -69,7 +70,7 @@ EMAIL_RECIPIENT   = os.getenv("EMAIL_RECIPIENT")
 EMAIL_SMTP_HOST   = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
 EMAIL_SMTP_PORT   = int(os.getenv("EMAIL_SMTP_PORT", "587"))
 TRAINING_JOB_NAME = os.getenv("TRAINING_sentiment_comments",
-                               "BERT Sentiment Comments Fine-tuning (Balanced)")
+                               "BERT Sentiment Comments — 5-Fold CV (Balanced)")
 
 
 def send_email_notification(subject: str, body_html: str, body_text: str = None):
@@ -99,81 +100,56 @@ def send_email_notification(subject: str, body_html: str, body_text: str = None)
         print(f"⚠️  Failed to send email notification: {e}")
 
 
-def _build_success_email(summary: dict, wandb_url: str = None) -> tuple:
-    timestamp     = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    wandb_section = (
-        f'<p>📊 <a href="{wandb_url}">View full W&amp;B dashboard</a></p>'
-        if wandb_url else ""
-    )
-    metric_rows = "".join(
+def _build_cv_success_email(cv_summary: dict, wandb_group_url: str = None) -> tuple:
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = "".join(
         f"<tr><td style='padding:4px 12px'>{k}</td>"
-        f"<td style='padding:4px 12px'><b>"
-        f"{(f'{v:.4f}' if isinstance(v, float) else str(v))}"
-        f"</b></td></tr>"
-        for k, v in summary.items()
+        f"<td style='padding:4px 12px'><b>{v if isinstance(v, str) else f'{v:.4f}'}</b></td></tr>"
+        for k, v in cv_summary.items()
     )
+    wandb_section = f'<p>📊 <a href="{wandb_group_url}">View W&B group</a></p>' if wandb_group_url else ""
     html = f"""
     <html><body style='font-family:Arial,sans-serif;color:#222'>
-      <h2 style='color:#2e7d32'>✅ Training Completed Successfully</h2>
+      <h2 style='color:#2e7d32'>✅ 5-Fold CV Training Complete</h2>
       <p><b>Job:</b> {TRAINING_JOB_NAME}</p>
       <p><b>Finished at:</b> {timestamp}</p>
-      <h3>Final Metrics</h3>
-      <table border='1' cellspacing='0' cellpadding='0'
-             style='border-collapse:collapse;font-size:14px'>
-        <tr style='background:#e8f5e9'>
-          <th style='padding:6px 12px'>Metric</th>
-          <th style='padding:6px 12px'>Value</th>
-        </tr>
-        {metric_rows}
+      <h3>Cross-Validation Summary</h3>
+      <table border='1' cellspacing='0' cellpadding='0' style='border-collapse:collapse;font-size:14px'>
+        <tr style='background:#e8f5e9'><th style='padding:6px 12px'>Metric</th><th style='padding:6px 12px'>Value</th></tr>
+        {rows}
       </table>
       {wandb_section}
-      <p style='color:#888;font-size:12px'>Sent by sentiment_comments_finetune_balanced.py</p>
-    </body></html>
-    """
+      <p style='color:#888;font-size:12px'>Sent by sentiment_comments_finetune.py</p>
+    </body></html>"""
     plain = (
-        f"Training Completed Successfully\n"
-        f"Job: {TRAINING_JOB_NAME}\n"
-        f"Finished at: {timestamp}\n\n"
-        + "\n".join(
-            f"{k}: {(f'{v:.4f}' if isinstance(v, float) else str(v))}"
-            for k, v in summary.items()
-        )
-        + (f"\n\nW&B: {wandb_url}" if wandb_url else "")
+        f"5-Fold CV Complete\nJob: {TRAINING_JOB_NAME}\nFinished at: {timestamp}\n\n"
+        + "\n".join(f"{k}: {v}" for k, v in cv_summary.items())
+        + (f"\n\nW&B: {wandb_group_url}" if wandb_group_url else "")
     )
-    subject = f"✅ Training Complete — {TRAINING_JOB_NAME}"
-    return subject, html, plain
+    return f"✅ 5-Fold CV Complete — {TRAINING_JOB_NAME}", html, plain
 
 
-def _build_failure_email(error: Exception, tb_str: str) -> tuple:
+def _build_failure_email(error: Exception, tb_str: str, fold: int = None) -> tuple:
     timestamp  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    error_type = type(error).__name__
-    error_msg  = str(error)
+    fold_label = f" (Fold {fold})" if fold is not None else ""
     tb_escaped = tb_str.replace("<", "&lt;").replace(">", "&gt;")
     html = f"""
     <html><body style='font-family:Arial,sans-serif;color:#222'>
-      <h2 style='color:#c62828'>❌ Training Crashed</h2>
+      <h2 style='color:#c62828'>❌ Training Crashed{fold_label}</h2>
       <p><b>Job:</b> {TRAINING_JOB_NAME}</p>
       <p><b>Crashed at:</b> {timestamp}</p>
-      <p><b>Error:</b> <span style='color:#c62828'>{error_type}: {error_msg}</span></p>
+      <p><b>Error:</b> <span style='color:#c62828'>{type(error).__name__}: {error}</span></p>
       <h3>Traceback</h3>
-      <pre style='background:#f5f5f5;padding:12px;font-size:12px;overflow:auto'>{tb_escaped}</pre>
-      <p style='color:#888;font-size:12px'>Sent by sentiment_comments_finetune_balanced.py</p>
-    </body></html>
-    """
-    plain = (
-        f"Training Crashed\n"
-        f"Job: {TRAINING_JOB_NAME}\n"
-        f"Crashed at: {timestamp}\n\n"
-        f"Error: {error_type}: {error_msg}\n\n"
-        f"Traceback:\n{tb_str}"
-    )
-    subject = f"❌ Training Crashed — {TRAINING_JOB_NAME}"
-    return subject, html, plain
+      <pre style='background:#f5f5f5;padding:12px;font-size:12px'>{tb_escaped}</pre>
+      <p style='color:#888;font-size:12px'>Sent by sentiment_comments_finetune.py</p>
+    </body></html>"""
+    plain = f"Training Crashed{fold_label}\nJob: {TRAINING_JOB_NAME}\n\n{type(error).__name__}: {error}\n\n{tb_str}"
+    return f"❌ Training Crashed{fold_label} — {TRAINING_JOB_NAME}", html, plain
 
 
 # ==================== CONFIGURATION ====================
 print("=" * 80)
-print("BERT SENTIMENT ANALYSIS — STAGE 1: COMMENTS ONLY  [BALANCED — OPTION 3]")
+print("BERT SENTIMENT ANALYSIS — 5-FOLD CROSS VALIDATION  [BALANCED — OPTION 3]")
 print("=" * 80)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -189,24 +165,27 @@ COMMENT_COL = "comment_phrase"
 LABEL_COL   = "comment_sentiment"
 
 # ── Training hyperparameters ───────────────────────────────────────────────────
-MAX_LENGTH                   = 256   # max tokens per comment — kept as-is
-TRAIN_BATCH_SIZE             = 16    # unchanged (was already 16)
-EVAL_BATCH_SIZE              = 16    # reduced from 64 for consistency
-LEARNING_RATE                = 3e-5  # increased from 5e-6
-NUM_EPOCHS                   = 20    # early stopping decides actual stop point
-WARMUP_RATIO                 = 0.06  # reduced from 0.1
-WEIGHT_DECAY                 = 0.01  # reduced from 0.05
-GRADIENT_ACCUMULATION_STEPS  = 2     # effective batch = 32; was 1
-VAL_SPLIT                    = 0.1   # fraction of train set used for validation
+MAX_LENGTH                   = 256
+TRAIN_BATCH_SIZE             = 16
+EVAL_BATCH_SIZE              = 16
+LEARNING_RATE                = 3e-5
+NUM_EPOCHS                   = 7    # early stopping decides actual stop point
+WARMUP_RATIO                 = 0.06
+WEIGHT_DECAY                 = 0.01
+GRADIENT_ACCUMULATION_STEPS  = 2     # effective batch = 32
 EARLY_STOPPING_PATIENCE      = 3
+
+# ── Cross-validation ───────────────────────────────────────────────────────────
+N_FOLDS = 5
 
 # ── Balancing ──────────────────────────────────────────────────────────────────
 OVERSAMPLE_TRAIN  = True
 USE_CLASS_WEIGHTS = True
 
 # ── Output ─────────────────────────────────────────────────────────────────────
-OUTPUT_DIR = "HelaBERT_sentiment_comments_only_balanced"
-STAGE_TAG  = "comments_only_balanced"
+OUTPUT_DIR     = "HelaBERT_sentiment_comments_cv"
+BEST_MODEL_DIR = f"{OUTPUT_DIR}/best_model"   # saved from the highest-F1 fold
+STAGE_TAG      = "comments_only_balanced_cv"
 
 # ── Misc ───────────────────────────────────────────────────────────────────────
 RANDOM_SEED = 42
@@ -214,22 +193,13 @@ USE_FP16    = True
 NUM_WORKERS = 2
 
 # ── Weights & Biases ───────────────────────────────────────────────────────────
-USE_WANDB         = True
-WANDB_PROJECT     = "bert-sentiment-analysis"
-WANDB_RUN_NAME    = f"bert_{STAGE_TAG}_lr{LEARNING_RATE}_bs{TRAIN_BATCH_SIZE}_ep{NUM_EPOCHS}"
-WANDB_ENTITY      = None
-WANDB_RUN_ID_FILE = f"wandb_run_id_{STAGE_TAG}.txt"
+USE_WANDB      = True
+WANDB_PROJECT  = "bert-sentiment-analysis"
+WANDB_GROUP    = f"5fold_cv_lr{LEARNING_RATE}_bs{TRAIN_BATCH_SIZE}"
+WANDB_ENTITY   = None
 
-print("\n✓ Configuration loaded")
-print(f"  - BERT model:       {BERT_MODEL_PATH}")
-print(f"  - Tokenizer:        {TOKENIZER_MODEL}")
-print(f"  - Train data:       {TRAIN_DATA_PATH}")
-print(f"  - Test data:        {TEST_DATA_PATH}")
-print(f"  - Output directory: {OUTPUT_DIR}")
-print(f"  - Stage:            {STAGE_TAG}")
-print(f"  - Oversampling:     {'Enabled' if OVERSAMPLE_TRAIN else 'Disabled'}")
-print(f"  - Class weights:    {'Enabled' if USE_CLASS_WEIGHTS else 'Disabled'}")
-print(f"  - W&B logging:      {'Enabled' if USE_WANDB else 'Disabled'}")
+print(f"\n✓ Config loaded — {N_FOLDS}-fold CV, oversampling={'on' if OVERSAMPLE_TRAIN else 'off'}, "
+      f"class_weights={'on' if USE_CLASS_WEIGHTS else 'off'}")
 
 
 # ==================== RANDOM SEEDS ====================
@@ -239,7 +209,7 @@ np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(RANDOM_SEED)
-print("\n✓ Random seeds set")
+print("✓ Random seeds set")
 
 
 # ==================== ENVIRONMENT CHECK ====================
@@ -323,10 +293,10 @@ print("\n" + "=" * 80)
 print("ENCODING LABELS")
 print("=" * 80)
 
-# Fit encoder on ALL labels (train + test) so IDs are consistent across stages
-all_labels = pd.concat([train_df['label'], test_df['label']]).unique()
+# Fit encoder on ALL labels (train + test) so IDs are consistent
+all_label_vals = pd.concat([train_df['label'], test_df['label']]).unique()
 le = LabelEncoder()
-le.fit(sorted(all_labels))   # sorted for determinism
+le.fit(sorted(all_label_vals))   # sorted for determinism
 
 train_df['label_id'] = le.transform(train_df['label'])
 test_df['label_id']  = le.transform(test_df['label'])
@@ -347,104 +317,23 @@ for idx, lbl in sorted(id_to_label.items()):
     print(f"  [{idx}] {lbl:20s}  train: {tr:5d}  test: {te:5d}")
 print(f"\n✓ Label mapping saved to {OUTPUT_DIR}/label_mapping.csv")
 
+# Flatten to lists for CV indexing
+all_texts  = train_df['comment'].tolist()
+all_labels = train_df['label_id'].tolist()
 
-# ==================== TRAIN / VALIDATION SPLIT ====================
-print("\n" + "=" * 80)
-print("TRAIN / VALIDATION SPLIT")
-print("=" * 80)
-
-train_comments = train_df['comment'].tolist()
-train_labels   = train_df['label_id'].tolist()
-
-tr_texts, val_texts, tr_labels, val_labels = train_test_split(
-    train_comments, train_labels,
-    test_size=VAL_SPLIT,
-    random_state=RANDOM_SEED,
-    stratify=train_labels
-)
-
-print(f"  Train (before balancing): {len(tr_texts):,}")
-print(f"  Val                     : {len(val_texts):,}")
-print(f"  Test (held-out)         : {len(test_df):,}  (never touched during training)")
-
+# Test set (held-out — never touched during CV)
 test_comments = test_df['comment'].tolist()
 test_labels   = test_df['label_id'].tolist()
 
-print("\n  Train label distribution (before balancing):")
-for idx, cnt in sorted(Counter(tr_labels).items()):
-    print(f"    [{idx}] {id_to_label[idx]:20s}: {cnt}")
+print(f"\n✓ CV pool   : {len(all_texts):,} samples")
+print(f"✓ Test (held-out): {len(test_comments):,} samples  (never used in CV)")
 
-
-# ==================== OVERSAMPLING ====================
-print("\n" + "=" * 80)
-print("BALANCING TRAINING DATA (OVERSAMPLING)")
-print("=" * 80)
-
-
-def oversample(texts, labels, seed=42):
-    """
-    Oversample minority classes so every class matches the majority class count.
-    Applied ONLY to the training split — val and test sets are never touched.
-    """
-    stdlib_random.seed(seed)
-    counts    = Counter(labels)
-    max_count = max(counts.values())
-
-    balanced_texts  = list(texts)
-    balanced_labels = list(labels)
-
-    for label, count in counts.items():
-        needed  = max_count - count
-        if needed == 0:
-            continue
-        indices = [i for i, l in enumerate(labels) if l == label]
-        extras  = stdlib_random.choices(indices, k=needed)
-        balanced_texts  += [texts[i]  for i in extras]
-        balanced_labels += [labels[i] for i in extras]
-
-    combined = list(zip(balanced_texts, balanced_labels))
-    stdlib_random.shuffle(combined)
-    balanced_texts, balanced_labels = zip(*combined)
-    return list(balanced_texts), list(balanced_labels)
-
-
-if OVERSAMPLE_TRAIN:
-    original_train_size = len(tr_texts)
-    tr_texts, tr_labels = oversample(tr_texts, tr_labels, seed=RANDOM_SEED)
-
-    print(f"✓ Oversampling complete")
-    print(f"  - Before: {original_train_size:,} samples")
-    print(f"  - After:  {len(tr_texts):,} samples")
-    print(f"\n  Train label distribution (after oversampling):")
-    for idx, cnt in sorted(Counter(tr_labels).items()):
-        print(f"    [{idx}] {id_to_label[idx]:20s}: {cnt}")
-else:
-    print("⚠️  Oversampling disabled — using original distribution")
-
-
-# ==================== CLASS WEIGHTS ====================
-print("\n" + "=" * 80)
-print("COMPUTING CLASS WEIGHTS")
-print("=" * 80)
-
-# Compute from the original (pre-oversample) train split so minority classes
-# still receive a signal boost even after balancing
-original_tr_counts = Counter(train_labels)   # full train_df label_id counts
-class_weights_list = [1.0 / original_tr_counts.get(i, 1) for i in range(NUM_LABELS)]
-weights_tensor     = torch.tensor(class_weights_list, dtype=torch.float)
-weights_tensor     = weights_tensor / weights_tensor.sum() * NUM_LABELS
-
-print("Class weights (based on original training distribution):")
-for i, w in enumerate(weights_tensor):
-    print(f"  [{i}] {id_to_label[i]:20s}: {w.item():.4f}")
+print("\nFull training pool label distribution:")
+for idx, cnt in sorted(Counter(all_labels).items()):
+    print(f"  [{idx}] {id_to_label[idx]:20s}: {cnt:6d} ({100 * cnt / len(all_labels):.1f}%)")
 
 
 # ==================== DATASET CLASS ====================
-print("\n" + "=" * 80)
-print("CREATING PYTORCH DATASETS")
-print("=" * 80)
-
-
 class CommentDataset(Dataset):
     """Tokenise a comment and return input_ids + attention_mask + label."""
 
@@ -472,95 +361,75 @@ class CommentDataset(Dataset):
         }
 
 
-train_dataset = CommentDataset(tr_texts,       tr_labels,   sp, MAX_LENGTH)
-val_dataset   = CommentDataset(val_texts,       val_labels,  sp, MAX_LENGTH)
-test_dataset  = CommentDataset(test_comments,   test_labels, sp, MAX_LENGTH)
+# ==================== HELPERS ====================
 
-print(f"✓ train_dataset : {len(train_dataset):,} samples")
-print(f"✓ val_dataset   : {len(val_dataset):,} samples")
-print(f"✓ test_dataset  : {len(test_dataset):,} samples")
+def oversample(texts, labels, seed=42):
+    """Oversample minority classes to match majority class count."""
+    stdlib_random.seed(seed)
+    counts    = Counter(labels)
+    max_count = max(counts.values())
 
-sample = train_dataset[0]
-print(f"\nSample check:")
-print(f"  input_ids shape     : {sample['input_ids'].shape}")
-print(f"  attention_mask shape: {sample['attention_mask'].shape}")
-print(f"  label               : {sample['labels'].item()} → {id_to_label[sample['labels'].item()]}")
-print(f"  non-pad tokens      : {sample['attention_mask'].sum().item()}")
+    bal_texts, bal_labels = list(texts), list(labels)
+    for label, count in counts.items():
+        needed = max_count - count
+        if needed == 0:
+            continue
+        indices = [i for i, l in enumerate(labels) if l == label]
+        extras  = stdlib_random.choices(indices, k=needed)
+        bal_texts  += [texts[i]  for i in extras]
+        bal_labels += [labels[i] for i in extras]
+
+    combined = list(zip(bal_texts, bal_labels))
+    stdlib_random.shuffle(combined)
+    bal_texts, bal_labels = zip(*combined)
+    return list(bal_texts), list(bal_labels)
 
 
-# ==================== LOAD MODEL ====================
-print("\n" + "=" * 80)
-print("LOADING MODEL")
-print("=" * 80)
+def compute_class_weights(labels, num_labels):
+    """Inverse-frequency weights normalised so they sum to num_labels."""
+    counts  = Counter(labels)
+    weights = torch.tensor(
+        [1.0 / counts.get(i, 1) for i in range(num_labels)],
+        dtype=torch.float,
+    )
+    weights = weights / weights.sum() * num_labels
+    return weights
 
-if os.path.exists(BERT_CONFIG_FILE):
-    config = BertConfig.from_json_file(BERT_CONFIG_FILE)
-    print(f"✓ Config loaded from: {BERT_CONFIG_FILE}")
-else:
+
+def load_fresh_model(bert_model_path, bert_config_file, num_labels):
+    """Load a fresh copy of the model for each fold."""
+    if os.path.exists(bert_config_file):
+        config = BertConfig.from_json_file(bert_config_file)
+    else:
+        config = BertConfig.from_pretrained(bert_model_path)
+    config.num_labels          = num_labels
+    config.hidden_dropout_prob = 0.2
+
     try:
-        config = BertConfig.from_pretrained(BERT_MODEL_PATH)
-        print("✓ Config loaded from model directory")
+        base     = BertModel.from_pretrained(bert_model_path)
+        model    = BertForSequenceClassification(config)
+        base_sd  = base.state_dict()
+        model_sd = model.state_dict()
+        for name, param in base_sd.items():
+            if name in model_sd:
+                model_sd[name].copy_(param)
+        model.load_state_dict(model_sd, strict=False)
+        print("  ✓ Weights loaded via BertModel")
     except Exception:
-        config = None
-        print("⚠️  Config not found — will infer from model")
+        mlm      = BertForMaskedLM.from_pretrained(bert_model_path)
+        model    = BertForSequenceClassification(config)
+        mlm_sd   = mlm.state_dict()
+        model_sd = model.state_dict()
+        for name, param in mlm_sd.items():
+            if name.startswith('bert.') and name in model_sd:
+                model_sd[name].copy_(param)
+        model.load_state_dict(model_sd, strict=False)
+        print("  ✓ Weights loaded via BertForMaskedLM")
 
-if config:
-    config.num_labels          = NUM_LABELS
-    config.hidden_dropout_prob = 0.2   # increased from default 0.1
-                                       # counters duplicate memorisation from oversampling
-    print(f"  hidden_size: {config.hidden_size}  |  layers: {config.num_hidden_layers}"
-          f"  |  heads: {config.num_attention_heads}  |  num_labels: {config.num_labels}"
-          f"  |  dropout: {config.hidden_dropout_prob}")
-
-
-def load_bert_for_classification(model_path, cfg):
-    """Try BertModel → BertForMaskedLM → raise."""
-    try:
-        base  = BertModel.from_pretrained(model_path)
-        model = BertForSequenceClassification(cfg)
-        base_s = base.state_dict()
-        mod_s  = model.state_dict()
-        for name, param in base_s.items():
-            if name in mod_s:
-                mod_s[name].copy_(param)
-        model.load_state_dict(mod_s, strict=False)
-        print("✓ Weights loaded via BertModel")
-        return model
-    except Exception as e:
-        print(f"  BertModel load failed ({e}), trying MLM checkpoint...")
-
-    mlm = BertForMaskedLM.from_pretrained(model_path)
-    if cfg is None:
-        cfg = mlm.config
-        cfg.num_labels          = NUM_LABELS
-        cfg.hidden_dropout_prob = 0.2
-    model = BertForSequenceClassification(cfg)
-    mlm_s = mlm.state_dict()
-    mod_s = model.state_dict()
-    for name, param in mlm_s.items():
-        if name.startswith('bert.') and name in mod_s:
-            mod_s[name].copy_(param)
-    model.load_state_dict(mod_s, strict=False)
-    print("✓ Weights loaded via BertForMaskedLM")
-    return model
+    return model, config
 
 
-print(f"\nLoading weights from: {BERT_MODEL_PATH}")
-model = load_bert_for_classification(BERT_MODEL_PATH, config)
-
-total     = sum(p.numel() for p in model.parameters())
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"  Total params:     {total:,}")
-print(f"  Trainable params: {trainable:,}  ({100*trainable/total:.1f}%)")
-
-
-# ==================== METRICS ====================
-print("\n" + "=" * 80)
-print("SETTING UP METRICS")
-print("=" * 80)
-
-
-def compute_metrics(eval_pred: EvalPrediction):
+def compute_metrics(eval_pred: EvalPrediction) -> dict:
     preds  = np.argmax(eval_pred.predictions, axis=1)
     labels = eval_pred.label_ids
     return {
@@ -572,20 +441,17 @@ def compute_metrics(eval_pred: EvalPrediction):
     }
 
 
-print("✓ Metrics: accuracy, precision, recall, macro-F1, weighted-F1")
+def print_metric(key: str, value) -> None:
+    """Print a single training/eval metric, handling both float and non-float values."""
+    if isinstance(value, float):
+        print(f"    {key}: {value:.4f}")
+    else:
+        print(f"    {key}: {value}")
 
 
 # ==================== WEIGHTED TRAINER ====================
-print("\n" + "=" * 80)
-print("SETTING UP WEIGHTED TRAINER")
-print("=" * 80)
-
-
 class WeightedTrainer(Trainer):
-    """
-    Subclass of HuggingFace Trainer that replaces the default CrossEntropyLoss
-    with a class-weighted version. Acts as a safety net on top of oversampling.
-    """
+    """Trainer subclass that applies per-class loss weighting."""
 
     def __init__(self, class_weights: torch.Tensor, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -595,220 +461,393 @@ class WeightedTrainer(Trainer):
         labels  = inputs.get("labels")
         outputs = model(**inputs)
         logits  = outputs.get("logits")
-        loss    = nn.CrossEntropyLoss(
-            weight=self.class_weights.to(logits.device)
-        )(logits, labels)
+        loss_fn = nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device))
+        loss    = loss_fn(logits, labels)
         return (loss, outputs) if return_outputs else loss
 
 
-if USE_CLASS_WEIGHTS:
-    print("✓ WeightedTrainer will be used with class weights:")
-    for i, w in enumerate(weights_tensor):
-        print(f"  [{i}] {id_to_label[i]:20s}: {w.item():.4f}")
-else:
-    print("⚠️  Class weights disabled — falling back to standard Trainer")
+# ==================== CROSS-VALIDATION LOOP ====================
+print("\n" + "=" * 80)
+print(f"STARTING {N_FOLDS}-FOLD CROSS VALIDATION")
+print("=" * 80)
 
+skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ==================== WEIGHTS & BIASES ====================
-if USE_WANDB:
+# Storage for results across folds
+fold_metrics:  list[dict] = []
+all_y_true:    list[int]  = []
+all_y_pred:    list[int]  = []
+all_oof_texts: list[str]  = []
+best_fold_f1   = -1.0
+best_fold_idx  = -1
+wandb_group_url = None
+
+for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels), start=1):
     print("\n" + "=" * 80)
-    print("INITIALIZING W&B")
+    print(f"FOLD {fold_idx} / {N_FOLDS}")
     print("=" * 80)
 
-    wandb_run_id = None
-    if os.path.exists(WANDB_RUN_ID_FILE):
-        with open(WANDB_RUN_ID_FILE) as f:
-            wandb_run_id = f.read().strip()
-        print(f"  Resuming W&B run: {wandb_run_id}")
+    fold_output_dir = f"{OUTPUT_DIR}/fold_{fold_idx}"
+    os.makedirs(fold_output_dir, exist_ok=True)
 
-    if wandb.run is None:
+    # ── Split ──────────────────────────────────────────────────────────────────
+    fold_train_texts  = [all_texts[i]  for i in train_idx]
+    fold_train_labels = [all_labels[i] for i in train_idx]
+    fold_val_texts    = [all_texts[i]  for i in val_idx]
+    fold_val_labels   = [all_labels[i] for i in val_idx]
+
+    print(f"  Train: {len(fold_train_texts)} samples  |  Val: {len(fold_val_texts)} samples")
+
+    print("  Train label distribution (before oversampling):")
+    for lbl, cnt in sorted(Counter(fold_train_labels).items()):
+        print(f"    [{lbl}] {id_to_label[lbl]:20s}: {cnt}")
+
+    # ── Oversample (train only) ────────────────────────────────────────────────
+    if OVERSAMPLE_TRAIN:
+        fold_train_texts, fold_train_labels = oversample(
+            fold_train_texts, fold_train_labels, seed=RANDOM_SEED + fold_idx
+        )
+        print(f"  After oversampling: {len(fold_train_texts)} train samples")
+        print("  Train label distribution (after oversampling):")
+        for lbl, cnt in sorted(Counter(fold_train_labels).items()):
+            print(f"    [{lbl}] {id_to_label[lbl]:20s}: {cnt}")
+
+    # ── Class weights (computed from raw pre-oversample distribution) ──────────
+    raw_fold_labels = [all_labels[i] for i in train_idx]
+    fold_weights    = compute_class_weights(raw_fold_labels, NUM_LABELS)
+    if USE_CLASS_WEIGHTS:
+        print("  Class weights:")
+        for i, w in enumerate(fold_weights):
+            print(f"    [{i}] {id_to_label[i]:20s}: {w.item():.4f}")
+
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    train_ds = CommentDataset(fold_train_texts, fold_train_labels, sp, MAX_LENGTH)
+    val_ds   = CommentDataset(fold_val_texts,   fold_val_labels,   sp, MAX_LENGTH)
+
+    # ── Fresh model ────────────────────────────────────────────────────────────
+    print(f"  Loading fresh model for fold {fold_idx}...")
+    model, config = load_fresh_model(BERT_MODEL_PATH, BERT_CONFIG_FILE, NUM_LABELS)
+    total_p     = sum(p.numel() for p in model.parameters())
+    trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Parameters: {total_p:,} total, {trainable_p:,} trainable")
+
+    # ── W&B (one run per fold, all in the same group) ─────────────────────────
+    wandb_run_name = f"fold_{fold_idx}_of_{N_FOLDS}"
+    if USE_WANDB:
+        if wandb.run is not None:
+            wandb.finish()
         run = wandb.init(
             project=WANDB_PROJECT,
             entity=WANDB_ENTITY,
-            name=WANDB_RUN_NAME,
-            id=wandb_run_id,
-            resume="allow",
+            group=WANDB_GROUP,
+            name=wandb_run_name,
             config={
                 "stage":                   STAGE_TAG,
-                "balancing_strategy":      "oversample+class_weights",
-                "model":                   BERT_MODEL_PATH,
-                "tokenizer":               "SentencePiece",
-                "vocab_size":              sp.get_piece_size(),
-                "hidden_size":             config.hidden_size         if config else "?",
-                "num_layers":              config.num_hidden_layers   if config else "?",
-                "num_attention_heads":     config.num_attention_heads if config else "?",
-                "hidden_dropout_prob":     config.hidden_dropout_prob if config else 0.2,
-                "num_labels":              NUM_LABELS,
-                "label_names":             list(le.classes_),
+                "fold":                    fold_idx,
+                "n_folds":                 N_FOLDS,
                 "learning_rate":           LEARNING_RATE,
                 "epochs":                  NUM_EPOCHS,
-                "early_stopping_patience": EARLY_STOPPING_PATIENCE,
                 "train_batch_size":        TRAIN_BATCH_SIZE,
                 "effective_batch":         TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
                 "warmup_ratio":            WARMUP_RATIO,
                 "weight_decay":            WEIGHT_DECAY,
                 "max_length":              MAX_LENGTH,
-                "fp16":                    USE_FP16 and torch.cuda.is_available(),
-                "original_train_samples":  len(tr_texts) if not OVERSAMPLE_TRAIN else original_train_size,
-                "balanced_train_samples":  len(tr_texts),
-                "val_samples":             len(val_texts),
-                "test_samples":            len(test_comments),
-                **{f"class_weight_{id_to_label[i]}": weights_tensor[i].item()
+                "oversample":              OVERSAMPLE_TRAIN,
+                "class_weights":           USE_CLASS_WEIGHTS,
+                "train_samples_balanced":  len(fold_train_texts),
+                "val_samples":             len(fold_val_texts),
+                "num_labels":              NUM_LABELS,
+                "label_names":             list(le.classes_),
+                **{f"class_weight_{id_to_label[i]}": fold_weights[i].item()
                    for i in range(NUM_LABELS)},
-            }
+            },
+            reinit=True,
         )
-        with open(WANDB_RUN_ID_FILE, 'w') as f:
-            f.write(run.id)
-        print(f"✓ W&B run ID: {run.id}")
-        print(f"✓ Dashboard : {run.get_url()}")
         wandb.log({
-            "train_label_dist_balanced": wandb.Histogram(tr_labels),
-            "val_label_dist":            wandb.Histogram(val_labels),
-            "test_label_dist":           wandb.Histogram(test_labels),
+            "train_label_dist": wandb.Histogram(fold_train_labels),
+            "val_label_dist":   wandb.Histogram(fold_val_labels),
         })
+        if fold_idx == 1:
+            wandb_group_url = f"https://wandb.ai/{run.entity}/{WANDB_PROJECT}/groups/{WANDB_GROUP}"
+        print(f"  W&B run: {run.get_url()}")
+
+    # ── Training args ──────────────────────────────────────────────────────────
+    training_args = TrainingArguments(
+        output_dir=fold_output_dir,
+        num_train_epochs=NUM_EPOCHS,
+        per_device_train_batch_size=TRAIN_BATCH_SIZE,
+        per_device_eval_batch_size=EVAL_BATCH_SIZE,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        learning_rate=LEARNING_RATE,
+        lr_scheduler_type="cosine",
+        weight_decay=WEIGHT_DECAY,
+        warmup_ratio=WARMUP_RATIO,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        logging_steps=50,
+        logging_first_step=True,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_f1",
+        greater_is_better=True,
+        save_total_limit=2,
+        fp16=USE_FP16 and torch.cuda.is_available(),
+        dataloader_num_workers=NUM_WORKERS,
+        seed=RANDOM_SEED + fold_idx,
+        report_to="wandb" if USE_WANDB else "none",
+        run_name=wandb_run_name if USE_WANDB else None,
+        push_to_hub=False,
+    )
+
+    # ── Trainer ────────────────────────────────────────────────────────────────
+    early_stop = EarlyStoppingCallback(early_stopping_patience=EARLY_STOPPING_PATIENCE)
+
+    if USE_CLASS_WEIGHTS:
+        trainer = WeightedTrainer(
+            class_weights=fold_weights,
+            model=model, args=training_args,
+            train_dataset=train_ds, eval_dataset=val_ds,
+            compute_metrics=compute_metrics, callbacks=[early_stop],
+        )
+    else:
+        trainer = Trainer(
+            model=model, args=training_args,
+            train_dataset=train_ds, eval_dataset=val_ds,
+            compute_metrics=compute_metrics, callbacks=[early_stop],
+        )
+
+    # ── Train ──────────────────────────────────────────────────────────────────
+    try:
+        train_result = trainer.train()
+        print(f"\n  Fold {fold_idx} training complete.")
+        for k, v in train_result.metrics.items():
+            print_metric(k, v)
+
+    except KeyboardInterrupt:
+        print(f"\n  ⚠️  Interrupted at fold {fold_idx}.")
+        trainer.save_model(f"{fold_output_dir}/interrupted_model")
+        if USE_WANDB:
+            wandb.finish(exit_code=1)
+        _s, _h, _p = _build_failure_email(
+            KeyboardInterrupt("Manually interrupted"), "User interrupted training.", fold=fold_idx
+        )
+        send_email_notification(_s, _h, _p)
+        raise
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"\n  ❌ Fold {fold_idx} failed: {e}")
+        if USE_WANDB:
+            wandb.finish(exit_code=1)
+        _s, _h, _p = _build_failure_email(e, tb, fold=fold_idx)
+        send_email_notification(_s, _h, _p)
+        raise
+
+    # ── Evaluate ───────────────────────────────────────────────────────────────
+    print(f"\n  Evaluating fold {fold_idx}...")
+    eval_results = trainer.evaluate()
+    print(f"  Fold {fold_idx} eval metrics:")
+    for k, v in eval_results.items():
+        if isinstance(v, float):
+            print(f"    {k}: {v:.4f}")
+
+    # ── Predictions & per-class report ────────────────────────────────────────
+    preds_out = trainer.predict(val_ds)
+    y_pred    = np.argmax(preds_out.predictions, axis=-1)
+    y_true    = np.array(fold_val_labels)
+
+    # Accumulate for OOF report
+    all_y_true.extend(y_true.tolist())
+    all_y_pred.extend(y_pred.tolist())
+    all_oof_texts.extend(fold_val_texts)
+
+    target_names = [id_to_label[i] for i in range(NUM_LABELS)]
+    print(f"\n  Classification report — Fold {fold_idx}:")
+    print(classification_report(y_true, y_pred, target_names=target_names, digits=4))
+
+    # ── Save per-fold predictions ──────────────────────────────────────────────
+    fold_conf = [
+        torch.softmax(torch.tensor(preds_out.predictions[i]), dim=0)[y_pred[i]].item()
+        for i in range(len(y_pred))
+    ]
+    pd.DataFrame({
+        'comment':            fold_val_texts,
+        'true_label_id':      y_true,
+        'true_sentiment':     [id_to_label[l] for l in y_true],
+        'predicted_label_id': y_pred,
+        'predicted_sentiment':[id_to_label[l] for l in y_pred],
+        'correct':            y_true == y_pred,
+        'confidence':         fold_conf,
+    }).to_csv(f"{fold_output_dir}/predictions.csv", index=False)
+
+    # ── Per-class metrics ──────────────────────────────────────────────────────
+    prec_pc, rec_pc, f1_pc, sup_pc = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0
+    )
+    per_class_df = pd.DataFrame({
+        'Label ID':  range(NUM_LABELS),
+        'Sentiment': target_names,
+        'Precision': prec_pc,
+        'Recall':    rec_pc,
+        'F1-Score':  f1_pc,
+        'Support':   sup_pc,
+    })
+    per_class_df.to_csv(f"{fold_output_dir}/per_class_metrics.csv", index=False)
+
+    cm = confusion_matrix(y_true, y_pred)
+    pd.DataFrame(
+        cm,
+        index=[f"True_{id_to_label[i]}"  for i in range(NUM_LABELS)],
+        columns=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)],
+    ).to_csv(f"{fold_output_dir}/confusion_matrix.csv")
+
+    # ── Store fold-level metrics ───────────────────────────────────────────────
+    fold_m = {
+        'fold':        fold_idx,
+        'accuracy':    eval_results['eval_accuracy'],
+        'precision':   eval_results['eval_precision'],
+        'recall':      eval_results['eval_recall'],
+        'f1':          eval_results['eval_f1'],
+        'f1_weighted': eval_results['eval_f1_weighted'],
+    }
+    fold_metrics.append(fold_m)
+
+    # ── W&B fold summary ──────────────────────────────────────────────────────
+    if USE_WANDB:
+        wandb.log({
+            "fold_summary/accuracy":    fold_m['accuracy'],
+            "fold_summary/f1":          fold_m['f1'],
+            "fold_summary/f1_weighted": fold_m['f1_weighted'],
+            "fold_summary/precision":   fold_m['precision'],
+            "fold_summary/recall":      fold_m['recall'],
+        })
+        wandb.log({"per_class_metrics": wandb.Table(dataframe=per_class_df)})
+        try:
+            import plotly.figure_factory as ff
+            fig = ff.create_annotated_heatmap(
+                z=cm,
+                x=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)],
+                y=[f"True_{id_to_label[i]}" for i in range(NUM_LABELS)],
+                colorscale='Blues',
+                showscale=True,
+            )
+            fig.update_layout(
+                title=f"Confusion Matrix — Fold {fold_idx}",
+                xaxis_title="Predicted",
+                yaxis_title="True",
+            )
+            wandb.log({"confusion_matrix": fig})
+        except ImportError:
+            pass
+        wandb.finish()
+        print(f"  ✓ W&B fold {fold_idx} run finished")
+
+    # ── Save best model ────────────────────────────────────────────────────────
+    if fold_m['f1'] > best_fold_f1:
+        best_fold_f1  = fold_m['f1']
+        best_fold_idx = fold_idx
+        trainer.save_model(BEST_MODEL_DIR)
+        if config:
+            config.save_pretrained(BEST_MODEL_DIR)
+        mapping_df.to_csv(f"{BEST_MODEL_DIR}/label_mapping.csv", index=False)
+        print(f"\n  ★ New best model saved (fold {fold_idx}, F1={best_fold_f1:.4f}) → {BEST_MODEL_DIR}")
+
+    print(f"\n  Fold {fold_idx} done — macro F1: {fold_m['f1']:.4f}")
 
 
-# ==================== TRAINING ARGS ====================
+# ==================== CROSS-VALIDATION SUMMARY ====================
 print("\n" + "=" * 80)
-print("CONFIGURING TRAINER")
+print("CROSS-VALIDATION RESULTS")
 print("=" * 80)
 
-training_args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
+metrics_df = pd.DataFrame(fold_metrics)
+metrics_df.to_csv(f"{OUTPUT_DIR}/cv_fold_metrics.csv", index=False)
 
-    num_train_epochs=NUM_EPOCHS,
-    per_device_train_batch_size=TRAIN_BATCH_SIZE,
+print("\nPer-fold results:")
+print(metrics_df.to_string(index=False))
+
+mean_metrics = metrics_df.drop(columns=['fold']).mean()
+std_metrics  = metrics_df.drop(columns=['fold']).std()
+
+print("\n" + "-" * 60)
+print(f"{'Metric':<20} {'Mean':>10} {'Std':>10} {'95% CI':>20}")
+print("-" * 60)
+for metric in ['accuracy', 'precision', 'recall', 'f1', 'f1_weighted']:
+    m     = mean_metrics[metric]
+    s     = std_metrics[metric]
+    ci_lo = m - 1.96 * s / (N_FOLDS ** 0.5)
+    ci_hi = m + 1.96 * s / (N_FOLDS ** 0.5)
+    print(f"  {metric:<18} {m:>10.4f} {s:>10.4f}   [{ci_lo:.4f}, {ci_hi:.4f}]")
+print("-" * 60)
+print(f"\n  Best single fold: Fold {best_fold_idx}  (macro F1 = {best_fold_f1:.4f})")
+print(f"  Best model saved to: {BEST_MODEL_DIR}")
+
+
+# ==================== OUT-OF-FOLD (OOF) REPORT ====================
+print("\n" + "=" * 80)
+print("OUT-OF-FOLD (OOF) REPORT — FULL TRAINING POOL")
+print("=" * 80)
+
+oof_y_true   = np.array(all_y_true)
+oof_y_pred   = np.array(all_y_pred)
+target_names = [id_to_label[i] for i in range(NUM_LABELS)]
+print(classification_report(oof_y_true, oof_y_pred, target_names=target_names, digits=4))
+
+oof_f1   = f1_score(oof_y_true, oof_y_pred, average='macro',    zero_division=0)
+oof_f1_w = f1_score(oof_y_true, oof_y_pred, average='weighted', zero_division=0)
+oof_acc  = accuracy_score(oof_y_true, oof_y_pred)
+
+print(f"OOF macro F1:    {oof_f1:.4f}")
+print(f"OOF weighted F1: {oof_f1_w:.4f}")
+print(f"OOF accuracy:    {oof_acc:.4f}")
+
+oof_cm = confusion_matrix(oof_y_true, oof_y_pred)
+pd.DataFrame(
+    oof_cm,
+    index=[f"True_{id_to_label[i]}"  for i in range(NUM_LABELS)],
+    columns=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)],
+).to_csv(f"{OUTPUT_DIR}/oof_confusion_matrix.csv")
+
+pd.DataFrame({
+    'comment':            all_oof_texts,
+    'true_label_id':      oof_y_true,
+    'true_sentiment':     [id_to_label[l] for l in oof_y_true],
+    'predicted_label_id': oof_y_pred,
+    'predicted_sentiment':[id_to_label[l] for l in oof_y_pred],
+    'correct':            oof_y_true == oof_y_pred,
+}).to_csv(f"{OUTPUT_DIR}/oof_predictions.csv", index=False)
+
+print(f"\n✓ OOF confusion matrix → {OUTPUT_DIR}/oof_confusion_matrix.csv")
+print(f"✓ OOF predictions      → {OUTPUT_DIR}/oof_predictions.csv")
+
+
+# ==================== TEST SET EVALUATION (best fold model) ====================
+print("\n" + "=" * 80)
+print(f"TEST SET EVALUATION  (held-out)  — using best fold model (fold {best_fold_idx})")
+print("=" * 80)
+
+test_dataset = CommentDataset(test_comments, test_labels, sp, MAX_LENGTH)
+
+# Re-load the best saved model for test evaluation
+best_config = BertConfig.from_pretrained(BEST_MODEL_DIR)
+best_model  = BertForSequenceClassification.from_pretrained(BEST_MODEL_DIR)
+
+test_eval_args = TrainingArguments(
+    output_dir=f"{OUTPUT_DIR}/test_eval_tmp",
     per_device_eval_batch_size=EVAL_BATCH_SIZE,
-    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-
-    learning_rate=LEARNING_RATE,
-    lr_scheduler_type="cosine",
-    weight_decay=WEIGHT_DECAY,
-    warmup_ratio=WARMUP_RATIO,
-
-    eval_strategy="epoch",
-    save_strategy="epoch",
-    logging_steps=50,
-    logging_first_step=True,
-
-    load_best_model_at_end=True,
-    metric_for_best_model="eval_f1",   # fixed: must match the logged key
-    greater_is_better=True,
-    save_total_limit=3,
-
     fp16=USE_FP16 and torch.cuda.is_available(),
     dataloader_num_workers=NUM_WORKERS,
-    seed=RANDOM_SEED,
-
-    report_to="wandb" if USE_WANDB else "none",
-    run_name=WANDB_RUN_NAME if USE_WANDB else None,
-    push_to_hub=False,
+    report_to="none",
+)
+test_trainer = Trainer(
+    model=best_model,
+    args=test_eval_args,
+    compute_metrics=compute_metrics,
 )
 
-early_stopping = EarlyStoppingCallback(
-    early_stopping_patience=EARLY_STOPPING_PATIENCE
-)
-
-if USE_CLASS_WEIGHTS:
-    trainer = WeightedTrainer(
-        class_weights=weights_tensor,
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        compute_metrics=compute_metrics,
-        callbacks=[early_stopping],
-    )
-    print("✓ WeightedTrainer initialized (oversampling + class weights active)")
-else:
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        compute_metrics=compute_metrics,
-        callbacks=[early_stopping],
-    )
-    print("✓ Standard Trainer initialized (oversampling only)")
-
-print(f"  Approx steps/epoch: "
-      f"~{len(train_dataset) // (TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)}")
-
-
-# ==================== TRAINING ====================
-print("\n" + "=" * 80)
-print("STARTING TRAINING")
-print("=" * 80)
-print(f"Stage : {STAGE_TAG}")
-print(f"Input : comment text only")
-print(f"Labels: {', '.join(le.classes_)}")
-print(f"Early stopping patience: {EARLY_STOPPING_PATIENCE} epochs")
-if USE_WANDB:
-    print(f"W&B   : {wandb.run.get_url()}")
-print()
-
-try:
-    train_result = trainer.train()
-    print("\n✓ Training complete")
-    for k, v in train_result.metrics.items():
-        print(f"  {k}: {v:.4f}")
-
-except KeyboardInterrupt:
-    print("\nInterrupted — saving model...")
-    trainer.save_model(f"{OUTPUT_DIR}/interrupted_model")
-    if USE_WANDB:
-        wandb.finish(exit_code=1)
-    _subj, _html, _plain = _build_failure_email(
-        KeyboardInterrupt("Training was manually interrupted (KeyboardInterrupt)"),
-        "Training was manually interrupted by the user."
-    )
-    send_email_notification(_subj, _html, _plain)
-    raise
-
-except Exception as e:
-    tb_str = traceback.format_exc()
-    print(f"\n❌ Training failed: {e}")
-    if USE_WANDB:
-        wandb.finish(exit_code=1)
-    _subj, _html, _plain = _build_failure_email(e, tb_str)
-    send_email_notification(_subj, _html, _plain)
-    raise
-
-
-# ==================== SAVE FINAL MODEL ====================
-print("\n" + "=" * 80)
-print("SAVING MODEL")
-print("=" * 80)
-
-final_model_path = f"{OUTPUT_DIR}/final_model"
-trainer.save_model(final_model_path)
-if config:
-    config.save_pretrained(final_model_path)
-mapping_df.to_csv(f"{final_model_path}/label_mapping.csv", index=False)
-print(f"✓ Model saved to: {final_model_path}")
-print(f"✓ Label mapping saved alongside model")
-
-
-# ==================== EVALUATE ON VALIDATION SET ====================
-print("\n" + "=" * 80)
-print("VALIDATION SET EVALUATION")
-print("=" * 80)
-
-val_results = trainer.evaluate()
-print("\nValidation metrics:")
-for k, v in val_results.items():
-    fmt = f"{v:.4f}" if isinstance(v, float) else str(v)
-    print(f"  {k:30s}: {fmt}")
-
-
-# ==================== EVALUATE ON TEST SET ====================
-print("\n" + "=" * 80)
-print("TEST SET EVALUATION  (held-out)")
-print("=" * 80)
-
-test_output = trainer.predict(test_dataset)
-y_pred      = np.argmax(test_output.predictions, axis=-1)
-y_true      = np.array(test_labels)
+test_output  = test_trainer.predict(test_dataset)
+y_pred       = np.argmax(test_output.predictions, axis=-1)
+y_true       = np.array(test_labels)
 
 test_metrics = {
     'accuracy':    accuracy_score(y_true, y_pred),
@@ -818,229 +857,165 @@ test_metrics = {
     'f1_weighted': f1_score(y_true, y_pred,        average='weighted', zero_division=0),
 }
 
-print("\nTest metrics:")
+print("\nTest metrics (best fold model):")
 for k, v in test_metrics.items():
     print(f"  {k:20s}: {v:.4f}")
 
-if USE_WANDB:
-    wandb.log({f"test/{k}": v for k, v in test_metrics.items()})
+print(f"\nClassification report — test set:")
+print(classification_report(y_true, y_pred, target_names=target_names, digits=4))
 
-
-# ==================== DETAILED REPORT ====================
-print("\n" + "=" * 80)
-print("CLASSIFICATION REPORT (test set)")
-print("=" * 80)
-
-target_names = [id_to_label[i] for i in range(NUM_LABELS)]
-report_text  = classification_report(y_true, y_pred, target_names=target_names, digits=4)
-print(report_text)
-
-if USE_WANDB:
-    wandb.log({"test/classification_report": wandb.Table(
-        data=[[report_text]], columns=["report"]
-    )})
-
-
-# ==================== CONFUSION MATRIX ====================
-print("\n" + "=" * 80)
-print("CONFUSION MATRIX (test set)")
-print("=" * 80)
-
-cm    = confusion_matrix(y_true, y_pred)
-cm_df = pd.DataFrame(
-    cm,
+# Test confusion matrix
+test_cm = confusion_matrix(y_true, y_pred)
+pd.DataFrame(
+    test_cm,
     index=[f"True_{id_to_label[i]}"  for i in range(NUM_LABELS)],
-    columns=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)]
-)
-print(cm_df.to_string())
-cm_df.to_csv(f"{OUTPUT_DIR}/confusion_matrix_test.csv")
-print(f"\n✓ Saved to {OUTPUT_DIR}/confusion_matrix_test.csv")
+    columns=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)],
+).to_csv(f"{OUTPUT_DIR}/confusion_matrix_test.csv")
 
-if USE_WANDB:
-    try:
-        import plotly.figure_factory as ff
-        fig = ff.create_annotated_heatmap(
-            z=cm,
-            x=[f"Pred_{id_to_label[i]}"  for i in range(NUM_LABELS)],
-            y=[f"True_{id_to_label[i]}"  for i in range(NUM_LABELS)],
-            colorscale='Blues', showscale=True
-        )
-        fig.update_layout(title=f"Confusion Matrix — {STAGE_TAG}",
-                          xaxis_title="Predicted", yaxis_title="True")
-        wandb.log({"test/confusion_matrix": fig})
-    except ImportError:
-        print("⚠️  plotly not installed — skipping heatmap")
-
-
-# ==================== PER-CLASS METRICS ====================
-print("\n" + "=" * 80)
-print("PER-CLASS METRICS (test set)")
-print("=" * 80)
-
+# Per-class metrics on test set
 prec_pc, rec_pc, f1_pc, sup_pc = precision_recall_fscore_support(
     y_true, y_pred, average=None, zero_division=0
 )
-
-per_class_df = pd.DataFrame({
+per_class_test_df = pd.DataFrame({
     'Label ID':  range(NUM_LABELS),
     'Sentiment': target_names,
     'Precision': prec_pc,
     'Recall':    rec_pc,
     'F1-Score':  f1_pc,
-    'Support':   sup_pc
+    'Support':   sup_pc,
 })
-print(per_class_df.to_string(index=False))
-per_class_df.to_csv(f"{OUTPUT_DIR}/per_class_metrics_test.csv", index=False)
-print(f"\n✓ Saved to {OUTPUT_DIR}/per_class_metrics_test.csv")
+per_class_test_df.to_csv(f"{OUTPUT_DIR}/per_class_metrics_test.csv", index=False)
 
-if USE_WANDB:
-    wandb.log({"test/per_class_metrics": wandb.Table(dataframe=per_class_df)})
-    for metric in ['Precision', 'Recall', 'F1-Score']:
-        data = [[target_names[i], per_class_df.loc[i, metric]] for i in range(NUM_LABELS)]
-        tbl  = wandb.Table(data=data, columns=["Sentiment", metric])
-        wandb.log({f"test/per_class_{metric.lower().replace('-','_')}":
-                   wandb.plot.bar(tbl, "Sentiment", metric, title=f"Per-Class {metric}")})
-
-
-# ==================== SAMPLE PREDICTIONS ====================
-print("\n" + "=" * 80)
-print("SAMPLE PREDICTIONS (test set)")
-print("=" * 80)
-
-correct_mask      = (y_pred == y_true)
-correct_indices   = np.where(correct_mask)[0]
-incorrect_indices = np.where(~correct_mask)[0]
-
-print(f"\n  Correct  : {correct_mask.sum()} / {len(y_true)} "
-      f"({100*correct_mask.sum()/len(y_true):.2f}%)")
-print(f"  Incorrect: {(~correct_mask).sum()} / {len(y_true)} "
-      f"({100*(~correct_mask).sum()/len(y_true):.2f}%)")
-
-sample_rows = []
-
-print("\n── Correct (showing 5) ──────────────────────────────────────────────")
-for i, idx in enumerate(correct_indices[:5]):
-    probs      = torch.softmax(torch.tensor(test_output.predictions[idx]), dim=0)
-    confidence = probs[y_pred[idx]].item()
-    preview    = test_comments[idx][:100] + "..." if len(test_comments[idx]) > 100 else test_comments[idx]
-    print(f"\n{i+1}. {preview}")
-    print(f"   True: {id_to_label[y_true[idx]]:15s}  Pred: {id_to_label[y_pred[idx]]:15s}  Conf: {confidence:.4f}")
-    if USE_WANDB and i < 10:
-        sample_rows.append([test_comments[idx], id_to_label[y_true[idx]],
-                            id_to_label[y_pred[idx]], confidence, "Correct"])
-
-if len(incorrect_indices) > 0:
-    print("\n── Incorrect (showing 5) ────────────────────────────────────────────")
-    for i, idx in enumerate(incorrect_indices[:5]):
-        probs      = torch.softmax(torch.tensor(test_output.predictions[idx]), dim=0)
-        confidence = probs[y_pred[idx]].item()
-        true_conf  = probs[y_true[idx]].item()
-        preview    = test_comments[idx][:100] + "..." if len(test_comments[idx]) > 100 else test_comments[idx]
-        print(f"\n{i+1}. {preview}")
-        print(f"   True: {id_to_label[y_true[idx]]:15s} [{true_conf:.4f}]  "
-              f"Pred: {id_to_label[y_pred[idx]]:15s} [{confidence:.4f}]")
-        if USE_WANDB and i < 10:
-            sample_rows.append([test_comments[idx], id_to_label[y_true[idx]],
-                                id_to_label[y_pred[idx]], confidence, "Incorrect"])
-
-if USE_WANDB and sample_rows:
-    wandb.log({"test/sample_predictions": wandb.Table(
-        data=sample_rows,
-        columns=["Comment", "True Sentiment", "Predicted Sentiment", "Confidence", "Result"]
-    )})
-
-
-# ==================== SAVE PREDICTIONS ====================
-print("\n" + "=" * 80)
-print("SAVING PREDICTIONS")
-print("=" * 80)
-
-confidences = [
+# Test predictions CSV
+test_confidences = [
     torch.softmax(torch.tensor(test_output.predictions[i]), dim=0)[y_pred[i]].item()
     for i in range(len(y_pred))
 ]
-
-results_df = pd.DataFrame({
+pd.DataFrame({
     'comment':             test_comments,
     'true_label_id':       y_true,
     'true_sentiment':      [id_to_label[l] for l in y_true],
     'predicted_label_id':  y_pred,
     'predicted_sentiment': [id_to_label[l] for l in y_pred],
     'correct':             y_true == y_pred,
-    'confidence':          confidences
-})
-results_df.to_csv(f"{OUTPUT_DIR}/predictions_test.csv", index=False)
-print(f"✓ Predictions saved to {OUTPUT_DIR}/predictions_test.csv")
+    'confidence':          test_confidences,
+}).to_csv(f"{OUTPUT_DIR}/predictions_test.csv", index=False)
+
+print(f"\n✓ Test confusion matrix   → {OUTPUT_DIR}/confusion_matrix_test.csv")
+print(f"✓ Test per-class metrics  → {OUTPUT_DIR}/per_class_metrics_test.csv")
+print(f"✓ Test predictions        → {OUTPUT_DIR}/predictions_test.csv")
 
 
-# ==================== SUMMARY ====================
-summary = {
+# ==================== W&B CROSS-VAL SUMMARY RUN ====================
+if USE_WANDB:
+    print("\nLogging CV summary to W&B...")
+    wandb.init(
+        project=WANDB_PROJECT,
+        entity=WANDB_ENTITY,
+        group=WANDB_GROUP,
+        name="cv_summary",
+        reinit=True,
+    )
+    for metric in ['accuracy', 'precision', 'recall', 'f1', 'f1_weighted']:
+        wandb.log({
+            f"cv_mean/{metric}": mean_metrics[metric],
+            f"cv_std/{metric}":  std_metrics[metric],
+        })
+    wandb.log({
+        "oof/f1":          oof_f1,
+        "oof/f1_weighted": oof_f1_w,
+        "oof/accuracy":    oof_acc,
+        "best_fold":       best_fold_idx,
+        "best_fold_f1":    best_fold_f1,
+        "cv_fold_metrics": wandb.Table(dataframe=metrics_df),
+        **{f"test/{k}": v for k, v in test_metrics.items()},
+    })
+    wandb.log({"test/per_class_metrics": wandb.Table(dataframe=per_class_test_df)})
+    try:
+        import plotly.figure_factory as ff
+        fig = ff.create_annotated_heatmap(
+            z=oof_cm,
+            x=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)],
+            y=[f"True_{id_to_label[i]}" for i in range(NUM_LABELS)],
+            colorscale='Blues',
+            showscale=True,
+        )
+        fig.update_layout(
+            title="OOF Confusion Matrix — All Folds",
+            xaxis_title="Predicted",
+            yaxis_title="True",
+        )
+        wandb.log({"oof_confusion_matrix": fig})
+        fig2 = ff.create_annotated_heatmap(
+            z=test_cm,
+            x=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)],
+            y=[f"True_{id_to_label[i]}" for i in range(NUM_LABELS)],
+            colorscale='Blues',
+            showscale=True,
+        )
+        fig2.update_layout(
+            title=f"Test Confusion Matrix — Best Model (Fold {best_fold_idx})",
+            xaxis_title="Predicted",
+            yaxis_title="True",
+        )
+        wandb.log({"test_confusion_matrix": fig2})
+    except ImportError:
+        pass
+    wandb.finish()
+    print(f"✓ CV summary logged — group: {WANDB_GROUP}")
+
+
+# ==================== FINAL SUMMARY ====================
+cv_summary = {
     'Stage':                  STAGE_TAG,
     'Model':                  'BERT with SentencePiece',
+    'Task':                   'Sentiment Analysis — Comments Only',
     'Balancing':              'Oversample + Class Weights',
-    'Input':                  'comment_phrase only',
+    'N Folds':                N_FOLDS,
     'Num Classes':            NUM_LABELS,
     'Classes':                ', '.join(le.classes_),
-    'Original Train Samples': original_train_size if OVERSAMPLE_TRAIN else len(tr_texts),
-    'Balanced Train Samples': len(tr_texts),
-    'Val Samples':            len(val_texts),
+    'Train Pool Samples':     len(all_texts),
     'Test Samples':           len(test_comments),
-    'Epochs':                 NUM_EPOCHS,
     'Learning Rate':          LEARNING_RATE,
-    'Batch Size':             TRAIN_BATCH_SIZE,
     'Effective Batch Size':   TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
     'Max Length':             MAX_LENGTH,
-    # val metrics
-    'Val Accuracy':           val_results.get('eval_accuracy',    float('nan')),
-    'Val F1 (macro)':         val_results.get('eval_f1',          float('nan')),
-    'Val F1 (weighted)':      val_results.get('eval_f1_weighted', float('nan')),
-    # test metrics
-    'Test Accuracy':          test_metrics['accuracy'],
-    'Test Precision':         test_metrics['precision'],
-    'Test Recall':            test_metrics['recall'],
-    'Test F1 (macro)':        test_metrics['f1'],
-    'Test F1 (weighted)':     test_metrics['f1_weighted'],
+    'Best Fold':              best_fold_idx,
+    'Best Fold F1':           f'{best_fold_f1:.4f}',
+    'Mean F1 (macro)':        f'{mean_metrics["f1"]:.4f} ± {std_metrics["f1"]:.4f}',
+    'Mean F1 (weighted)':     f'{mean_metrics["f1_weighted"]:.4f} ± {std_metrics["f1_weighted"]:.4f}',
+    'Mean Accuracy':          f'{mean_metrics["accuracy"]:.4f} ± {std_metrics["accuracy"]:.4f}',
+    'OOF F1 (macro)':         f'{oof_f1:.4f}',
+    'OOF F1 (weighted)':      f'{oof_f1_w:.4f}',
+    'OOF Accuracy':           f'{oof_acc:.4f}',
+    'Test F1 (macro)':        f'{test_metrics["f1"]:.4f}',
+    'Test F1 (weighted)':     f'{test_metrics["f1_weighted"]:.4f}',
+    'Test Accuracy':          f'{test_metrics["accuracy"]:.4f}',
 }
 
-summary_df = pd.DataFrame([summary])
-summary_df.to_csv(f"{OUTPUT_DIR}/training_summary.csv", index=False)
-
-if USE_WANDB:
-    wandb.log({"summary": wandb.Table(dataframe=summary_df)})
+pd.DataFrame([cv_summary]).to_csv(f'{OUTPUT_DIR}/cv_summary.csv', index=False)
 
 print("\n" + "=" * 80)
-print("FINAL SUMMARY")
+print("FINAL CROSS-VALIDATION SUMMARY")
 print("=" * 80)
-for k, v in summary.items():
-    fmt = f"{v:.4f}" if isinstance(v, float) else str(v)
-    print(f"  {k:28s}: {fmt}")
+for k, v in cv_summary.items():
+    print(f"  {k:<28}: {v}")
 
 print("\n" + "=" * 80)
-print("🎉 STAGE 1 (COMMENTS ONLY — BALANCED) COMPLETE!")
+print("🎉 5-FOLD CROSS-VALIDATION COMPLETE!")
 print("=" * 80)
-print(f"\nOutputs in: {OUTPUT_DIR}/")
-print(f"  final_model/                  — trained model + label_mapping.csv")
-print(f"  label_mapping.csv             — id ↔ sentiment name")
-print(f"  training_summary.csv          — all metrics (val + test)")
-print(f"  per_class_metrics_test.csv    — per-class breakdown")
-print(f"  predictions_test.csv          — all test predictions")
-print(f"  confusion_matrix_test.csv     — confusion matrix")
-print(f"\n→ Next: run sentiment_finetune_context.py (Stage 2) to include article body")
-print(f"        and compare against these baseline results.")
-
-if USE_WANDB:
-    print(f"\n📊 Full results: {wandb.run.get_url()}")
-    _wandb_url = wandb.run.get_url()
-    wandb.finish()
-    print("✓ W&B run finished")
-else:
-    _wandb_url = None
+print(f"\nOutputs saved to: {OUTPUT_DIR}/")
+print(f"  fold_1/ … fold_{N_FOLDS}/      per-fold predictions, metrics, confusion matrix")
+print(f"  best_model/                    best model weights (fold {best_fold_idx}) + label_mapping.csv")
+print(f"  cv_fold_metrics.csv            per-fold metric table")
+print(f"  cv_summary.csv                 overall CV + test summary")
+print(f"  oof_predictions.csv            out-of-fold predictions (full training pool)")
+print(f"  oof_confusion_matrix.csv       OOF confusion matrix")
+print(f"  predictions_test.csv           test set predictions (best fold model)")
+print(f"  confusion_matrix_test.csv      test set confusion matrix")
+print(f"  per_class_metrics_test.csv     test set per-class breakdown")
+if USE_WANDB and wandb_group_url:
+    print(f"\n📊 W&B group: {wandb_group_url}")
 
 # ==================== SEND COMPLETION EMAIL ====================
-print("\n" + "=" * 80)
-print("SENDING COMPLETION NOTIFICATION")
-print("=" * 80)
-_subj, _html, _plain = _build_success_email(summary, _wandb_url)
-send_email_notification(_subj, _html, _plain)
-
-print("\n" + "=" * 80)
+_s, _h, _p = _build_cv_success_email(cv_summary, wandb_group_url if USE_WANDB else None)
+send_email_notification(_s, _h, _p)
