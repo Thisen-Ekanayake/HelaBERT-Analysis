@@ -149,7 +149,7 @@ print("=" * 80)
 BERT_MODEL_PATH  = "HelaBERT"
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT/config.json"
-DATA_PATH        = "data/Sinhala-News-Category-classification/sinhala-news-categories.csv"
+DATA_PATH        = "data/Sinhala-News-Category-classification/train/news_train.csv"
 
 CATEGORY_NAMES = {0: "Category_0", 1: "Category_1", 2: "Category_2",
                   3: "Category_3", 4: "Category_4"}
