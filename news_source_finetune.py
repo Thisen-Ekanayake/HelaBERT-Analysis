@@ -155,7 +155,7 @@ TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT/config.json"
 
 # Dataset Path
-DATA_PATH = "data/Sinhala-News-Source-classification/sinhala-news-sources.csv"
+DATA_PATH = "data/Sinhala-News-Source-classification/train/news_source_train.csv"
 
 # Training Parameters
 NUM_LABELS                   = 9      # auto-detected from data below
