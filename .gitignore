@@ -10,6 +10,15 @@ models/
 .venv/
 wandb/
 
+HelaBERT_finetuned_news_category_cv/
+HelaBERT_finetuned_news_source_cv/
+HelaBERT_finetuned_writing_style_cv/
+HelaBERT_sentiment_comments_cv/
+
+eval_results_news_category/
+eval_results_news_source/
+eval_results_writing_style/
+
 model_card.md
 *.txt
 *.png
