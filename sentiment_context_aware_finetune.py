@@ -184,8 +184,8 @@ BERT_MODEL_PATH  = "HelaBERT"
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT/config.json"
 
-TRAIN_DATA_PATH  = "data/sinhala-sentiment-analysis/train.tsv"              # ← CHANGE: train TSV
-TEST_DATA_PATH   = "data/sinhala-sentiment-analysis/test.tsv"               # ← CHANGE: test  TSV
+TRAIN_DATA_PATH  = "data/sinhala-sentiment-analysis/outputs/train.csv"
+TEST_DATA_PATH   = "data/sinhala-sentiment-analysis/outputs/test.csv"
 
 # Stage 1 predictions CSV for end-of-run comparison (set None to skip)
 STAGE1_PREDICTIONS_CSV = "HelaBERT_sentiment_comments_only/predictions_test.csv"
@@ -208,13 +208,13 @@ CROSS_ATTN_HEADS   = 8     # must divide hidden_size (768/8 = 96 per head)
 CROSS_ATTN_DROPOUT = 0.1
 
 # ── Training ───────────────────────────────────────────────────────────────────
-TRAIN_BATCH_SIZE            = 8     # lower: MAX_CHUNKS+1 BERT passes per sample
+TRAIN_BATCH_SIZE            = 4     # lower: MAX_CHUNKS+1 BERT passes per sample
 EVAL_BATCH_SIZE             = 8
-LEARNING_RATE               = 1e-5
+LEARNING_RATE               = 2e-5
 NUM_EPOCHS                  = 10
 WARMUP_RATIO                = 0.1
 WEIGHT_DECAY                = 0.05
-GRADIENT_ACCUMULATION_STEPS = 8     # effective batch = 64
+GRADIENT_ACCUMULATION_STEPS = 4     # effective batch = 16
 VAL_SPLIT                   = 0.1
 
 # ── Output ─────────────────────────────────────────────────────────────────────
@@ -298,10 +298,11 @@ def find_col(df, name):
 
 
 def load_tsv(path):
+    sep = '\t' if path.endswith('.tsv') else ','
     try:
-        df = pd.read_csv(path, sep='\t')
+        df = pd.read_csv(path, sep=sep)
     except pd.errors.ParserError:
-        df = pd.read_csv(path, sep='\t', engine='python', on_bad_lines='skip')
+        df = pd.read_csv(path, sep=sep, engine='python', on_bad_lines='skip')
     df.columns = df.columns.str.strip()
     df = df[[find_col(df, BODY_COL),
              find_col(df, COMMENT_COL),
