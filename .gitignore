@@ -18,6 +18,7 @@ HelaBERT_sentiment_comments_cv/
 eval_results_news_category/
 eval_results_news_source/
 eval_results_writing_style/
+HelaBERT_sentiment_crossattn/
 
 model_card.md
 *.txt
