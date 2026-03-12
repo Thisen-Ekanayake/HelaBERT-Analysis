@@ -157,19 +157,19 @@ BERT_MODEL_PATH  = "HelaBERT"
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT/config.json"
 
-TRAIN_DATA_PATH = "data/sinhala-sentiment-analysis/train.tsv"
-TEST_DATA_PATH  = "data/sinhala-sentiment-analysis/test.tsv"
+TRAIN_DATA_PATH = "data/sinhala-sentiment-analysis/outputs/train.csv"
+TEST_DATA_PATH  = "data/sinhala-sentiment-analysis/outputs/test.csv"
 
 # ── TSV column names ───────────────────────────────────────────────────────────
 COMMENT_COL = "comment_phrase"
 LABEL_COL   = "comment_sentiment"
 
 # ── Training hyperparameters ───────────────────────────────────────────────────
-MAX_LENGTH                   = 256
+MAX_LENGTH                   = 64
 TRAIN_BATCH_SIZE             = 16
 EVAL_BATCH_SIZE              = 16
 LEARNING_RATE                = 3e-5
-NUM_EPOCHS                   = 7    # early stopping decides actual stop point
+NUM_EPOCHS                   = 15    # early stopping decides actual stop point
 WARMUP_RATIO                 = 0.06
 WEIGHT_DECAY                 = 0.01
 GRADIENT_ACCUMULATION_STEPS  = 2     # effective batch = 32
@@ -248,12 +248,13 @@ print(f"✓ Tokenizer loaded  |  vocab size: {sp.get_piece_size()}  |  PAD_ID: {
 
 # ==================== HELPER: LOAD TSV ====================
 def load_tsv(path: str, comment_col: str, label_col: str) -> pd.DataFrame:
-    """Load a TSV, clean column names, extract comment + label columns."""
+    """Load a CSV or TSV, clean column names, extract comment + label columns."""
+    sep = '\t' if path.endswith('.tsv') else ','
     try:
-        df = pd.read_csv(path, sep='\t')
+        df = pd.read_csv(path, sep=sep)
     except pd.errors.ParserError:
         print(f"  ⚠️  Parsing issues in {path}, retrying with python engine...")
-        df = pd.read_csv(path, sep='\t', engine='python', on_bad_lines='skip')
+        df = pd.read_csv(path, sep=sep, engine='python', on_bad_lines='skip')
 
     df.columns = df.columns.str.strip()
 
