@@ -30,11 +30,7 @@ Architecture:
 """
 
 import os
-import smtplib
 import traceback
-import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 import math
 import numpy as np
 import pandas as pd
@@ -63,7 +59,7 @@ print("=" * 80)
 print("BERT SENTIMENT — STAGE 2: CROSS-ATTENTION CONTEXT-AWARE MODEL")
 print("=" * 80)
 
-# ── File paths ─────────────────────────────────────────────────────────────────
+# ==================== File paths ==================== 
 BERT_MODEL_PATH  = "HelaBERT"
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT/config.json"
@@ -74,24 +70,24 @@ TEST_DATA_PATH   = "data/sinhala-sentiment-analysis/outputs/test.csv"
 # Stage 1 predictions CSV for end-of-run comparison (set None to skip)
 STAGE1_PREDICTIONS_CSV = "HelaBERT_sentiment_comments_only/predictions_test.csv"
 
-# ── TSV column names ───────────────────────────────────────────────────────────
+# ==================== TSV column names ==================== 
 BODY_COL    = "body"
 COMMENT_COL = "comment_phrase"
 LABEL_COL   = "comment_sentiment"
 
-# ── Sliding window ─────────────────────────────────────────────────────────────
+# ==================== Sliding window ==================== 
 CHUNK_SIZE   = 512    # tokens per chunk
 CHUNK_STRIDE = 256    # 50% overlap
 MAX_CHUNKS   = 16     # cap per article — reduce to 8 if OOM
 
-# ── Sequence lengths ───────────────────────────────────────────────────────────
+# ==================== Sequence lengths ====================
 COMMENT_MAX_LENGTH = 256
 
-# ── Cross-attention ────────────────────────────────────────────────────────────
+# ==================== Cross-attention ──────────────====================──────────────────────────────────────────────
 CROSS_ATTN_HEADS   = 8     # must divide hidden_size (768/8 = 96 per head)
 CROSS_ATTN_DROPOUT = 0.1
 
-# ── Training ───────────────────────────────────────────────────────────────────
+# ==================== Training ====================
 TRAIN_BATCH_SIZE            = 4     # lower: MAX_CHUNKS+1 BERT passes per sample
 EVAL_BATCH_SIZE             = 8
 LEARNING_RATE               = 2e-5
@@ -101,16 +97,16 @@ WEIGHT_DECAY                = 0.05
 GRADIENT_ACCUMULATION_STEPS = 4     # effective batch = 16
 VAL_SPLIT                   = 0.1
 
-# ── Output ─────────────────────────────────────────────────────────────────────
+# ==================== Output ====================
 OUTPUT_DIR = "HelaBERT_sentiment_crossattn"
 STAGE_TAG  = "cross_attention"
 
-# ── Misc ───────────────────────────────────────────────────────────────────────
+# ==================== Misc ====================
 RANDOM_SEED = 42
 USE_FP16    = True
 NUM_WORKERS = 2
 
-# ── W&B ────────────────────────────────────────────────────────────────────────
+# ==================== W&B ====================
 USE_WANDB         = True
 WANDB_PROJECT     = "bert-sentiment-analysis"
 WANDB_RUN_NAME    = f"bert_{STAGE_TAG}_lr{LEARNING_RATE}_bs{TRAIN_BATCH_SIZE}_ep{NUM_EPOCHS}"
@@ -118,13 +114,13 @@ WANDB_ENTITY      = None
 WANDB_RUN_ID_FILE = f"wandb_run_id_{STAGE_TAG}.txt"
 
 print("\n✓ Configuration loaded")
-print(f"  BERT model       : {BERT_MODEL_PATH}")
-print(f"  Train data       : {TRAIN_DATA_PATH}")
-print(f"  Test data        : {TEST_DATA_PATH}")
-print(f"  Output dir       : {OUTPUT_DIR}")
-print(f"  Chunk size/stride: {CHUNK_SIZE} / {CHUNK_STRIDE}  max chunks: {MAX_CHUNKS}")
-print(f"  Cross-attn heads : {CROSS_ATTN_HEADS}")
-print(f"  Effective batch  : {TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
+print(f"BERT model       : {BERT_MODEL_PATH}")
+print(f"Train data       : {TRAIN_DATA_PATH}")
+print(f"Test data        : {TEST_DATA_PATH}")
+print(f"Output dir       : {OUTPUT_DIR}")
+print(f"Chunk size/stride: {CHUNK_SIZE} / {CHUNK_STRIDE}  max chunks: {MAX_CHUNKS}")
+print(f"Cross-attn heads : {CROSS_ATTN_HEADS}")
+print(f"Effective batch  : {TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
 
 
 # ==================== SEEDS ====================
@@ -146,17 +142,17 @@ if torch.cuda.is_available():
     props = torch.cuda.get_device_properties(0)
     print(f"VRAM    : {props.total_memory / 1e9:.1f} GB")
 else:
-    print("⚠️  CPU only — sliding window will be slow")
+    print("CPU only — sliding window will be slow")
 
 
 # ==================== VERIFY PATHS ====================
 print("\n" + "=" * 80)
 print("VERIFYING PATHS")
 print("=" * 80)
-assert os.path.exists(BERT_MODEL_PATH), f"❌ {BERT_MODEL_PATH}"
-assert os.path.exists(TOKENIZER_MODEL), f"❌ {TOKENIZER_MODEL}"
-assert os.path.exists(TRAIN_DATA_PATH), f"❌ {TRAIN_DATA_PATH}"
-assert os.path.exists(TEST_DATA_PATH),  f"❌ {TEST_DATA_PATH}"
+assert os.path.exists(BERT_MODEL_PATH), f"{BERT_MODEL_PATH}"
+assert os.path.exists(TOKENIZER_MODEL), f"{TOKENIZER_MODEL}"
+assert os.path.exists(TRAIN_DATA_PATH), f"{TRAIN_DATA_PATH}"
+assert os.path.exists(TEST_DATA_PATH),  f"{TEST_DATA_PATH}"
 print("✓ All paths verified")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -269,16 +265,16 @@ print("\n" + "=" * 80)
 print("ARTICLE BODY LENGTH ANALYSIS")
 print("=" * 80)
 lengths = train_df['body'].apply(lambda x: len(sp.encode(x)))
-print(f"  min    : {lengths.min():,}")
-print(f"  mean   : {lengths.mean():.0f}")
-print(f"  median : {lengths.median():.0f}")
-print(f"  90th % : {lengths.quantile(0.90):.0f}")
-print(f"  max    : {lengths.max():,}")
+print(f"min    : {lengths.min():,}")
+print(f"mean   : {lengths.mean():.0f}")
+print(f"median : {lengths.median():.0f}")
+print(f"90th % : {lengths.quantile(0.90):.0f}")
+print(f"max    : {lengths.max():,}")
 avg_c = lengths.apply(
     lambda l: min(math.ceil(max(l - CHUNK_SIZE, 0) / CHUNK_STRIDE) + 1, MAX_CHUNKS)
 ).mean()
-print(f"\n  Avg chunks/article (capped {MAX_CHUNKS}): {avg_c:.1f}")
-print(f"  Overlap per boundary: {CHUNK_SIZE - CHUNK_STRIDE} tokens")
+print(f"\nAvg chunks/article (capped {MAX_CHUNKS}): {avg_c:.1f}")
+print(f"Overlap per boundary: {CHUNK_SIZE - CHUNK_STRIDE} tokens")
 
 
 # ==================== TRAIN / VAL SPLIT ====================
@@ -291,7 +287,7 @@ tr_idx, val_idx = train_test_split(
 )
 tr_df  = train_df.iloc[tr_idx].reset_index(drop=True)
 val_df = train_df.iloc[val_idx].reset_index(drop=True)
-print(f"  Train: {len(tr_df):,}  Val: {len(val_df):,}  Test: {len(test_df):,}")
+print(f"Train: {len(tr_df):,}  Val: {len(val_df):,}  Test: {len(test_df):,}")
 
 
 # ==================== DATASET ====================
@@ -340,10 +336,10 @@ test_dataset  = CrossAttnDataset(test_df)
 
 print(f"✓ train: {len(train_dataset):,}  val: {len(val_dataset):,}  test: {len(test_dataset):,}")
 s = train_dataset[0]
-print(f"\n  chunk_ids  : {s['chunk_ids'].shape}   [MAX_CHUNKS × CHUNK_SIZE]")
-print(f"  num_chunks : {s['num_chunks'].item()}  real chunks for this article")
-print(f"  comment_ids: {s['comment_ids'].shape}")
-print(f"  label      : {s['labels'].item()} → {id_to_label[s['labels'].item()]}")
+print(f"\nchunk_ids  : {s['chunk_ids'].shape}   [MAX_CHUNKS × CHUNK_SIZE]")
+print(f"num_chunks : {s['num_chunks'].item()}  real chunks for this article")
+print(f"comment_ids: {s['comment_ids'].shape}")
+print(f"label      : {s['labels'].item()} → {id_to_label[s['labels'].item()]}")
 
 
 # ==================== CROSS-ATTENTION MODULE ====================
@@ -487,14 +483,14 @@ else:
         print("✓ Config from model dir")
     except Exception:
         bert_config = None
-        print("⚠️  Config not found")
+        print("Config not found")
 
 print(f"\nLoading weights: {BERT_MODEL_PATH}")
 try:
     bert_backbone = BertModel.from_pretrained(BERT_MODEL_PATH)
     print("✓ BertModel loaded")
 except Exception as e:
-    print(f"  BertModel failed ({e}), extracting from MLM checkpoint...")
+    print(f"BertModel failed ({e}), extracting from MLM checkpoint...")
     mlm           = BertForMaskedLM.from_pretrained(BERT_MODEL_PATH)
     bert_backbone = mlm.bert
     if bert_config is None:
@@ -524,11 +520,11 @@ extra     = sum(p.numel() for p in
                 list(model.classifier.parameters()))
 
 print(f"\nModel statistics:")
-print(f"  Total params      : {total:,}")
-print(f"  Trainable params  : {trainable:,}  ({100*trainable/total:.1f}%)")
-print(f"  Extra params      : {extra:,}  (cross-attn + fusion norm + head)")
-print(f"  Cross-attn heads  : {CROSS_ATTN_HEADS}  head dim: {hidden_size // CROSS_ATTN_HEADS}")
-print(f"  Fusion input dim  : {hidden_size * 3}  (comment + ctx + comment⊙ctx)")
+print(f"Total params      : {total:,}")
+print(f"Trainable params  : {trainable:,}  ({100*trainable/total:.1f}%)")
+print(f"Extra params      : {extra:,}  (cross-attn + fusion norm + head)")
+print(f"Cross-attn heads  : {CROSS_ATTN_HEADS}  head dim: {hidden_size // CROSS_ATTN_HEADS}")
+print(f"Fusion input dim  : {hidden_size * 3}  (comment + ctx + comment⊙ctx)")
 
 
 # ==================== COLLATOR + CUSTOM TRAINER ====================
@@ -661,16 +657,16 @@ trainer = CrossAttnTrainer(
 approx_steps = (len(tr_df) * NUM_EPOCHS
                 // (TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
 print(f"✓ Trainer ready  |  approx optimiser steps: ~{approx_steps:,}")
-print(f"  Memory note: each step runs {MAX_CHUNKS}+1 BERT forward passes per sample in the batch")
+print(f"Memory note: each step runs {MAX_CHUNKS}+1 BERT forward passes per sample in the batch")
 
 
 # ==================== TRAINING ====================
 print("\n" + "=" * 80)
 print("STARTING TRAINING")
 print("=" * 80)
-print(f"  Architecture: shared BERT + {CROSS_ATTN_HEADS}-head cross-attention")
-print(f"  Fusion      : [comment ; ctx ; comment⊙ctx] → LayerNorm → Linear")
-print(f"  Labels      : {', '.join(le.classes_)}")
+print(f"Architecture: shared BERT + {CROSS_ATTN_HEADS}-head cross-attention")
+print(f"Fusion      : [comment ; ctx ; comment⊙ctx] → LayerNorm → Linear")
+print(f"Labels      : {', '.join(le.classes_)}")
 if USE_WANDB:
     print(f"  W&B         : {wandb.run.get_url()}")
 print()
@@ -689,7 +685,7 @@ except KeyboardInterrupt:
     
 except Exception as e:
     tb_str = traceback.format_exc()
-    print(f"\n❌ Training failed: {e}")
+    print(f"\nTraining failed: {e}")
 
 # ==================== SAVE MODEL ====================
 print("\n" + "=" * 80)
@@ -871,12 +867,12 @@ with torch.no_grad():
         correct_sym  = "✓" if y_true[si] == y_pred[si] else "✗"
 
         print(f"Sample {si+1} [{correct_sym}]")
-        print(f"  Comment : {comment_text}...")
-        print(f"  True    : {true_lbl}   Predicted: {pred_lbl}")
-        print(f"  Chunks  : {n_real} real  |  chunk attention weights (avg across {h} heads):")
+        print(f"Comment : {comment_text}...")
+        print(f"True    : {true_lbl}   Predicted: {pred_lbl}")
+        print(f"Chunks  : {n_real} real  |  chunk attention weights (avg across {h} heads):")
         for ci, w in enumerate(chunk_importance):
             bar = "█" * int(w * 40)
-            print(f"    chunk {ci:2d}: {w:.4f}  {bar}")
+            print(f"chunk {ci:2d}: {w:.4f}  {bar}")
         print()
 
         for ci, w in enumerate(chunk_importance):
@@ -919,14 +915,14 @@ if STAGE1_PREDICTIONS_CSV and os.path.exists(STAGE1_PREDICTIONS_CSV):
         }
         print(f"✓ Stage 1 results loaded from {STAGE1_PREDICTIONS_CSV}\n")
     except Exception as e:
-        print(f"⚠️  Could not load Stage 1 results: {e}\n")
+        print(f"Could not load Stage 1 results: {e}\n")
 else:
-    print(f"⚠️  STAGE1_PREDICTIONS_CSV not found — set it to enable comparison\n")
+    print(f"STAGE1_PREDICTIONS_CSV not found — set it to enable comparison\n")
 
 W = 22
-header = f"  {'Metric':18s}  {'Stage 1 (comments)':>{W}}  {'Stage 2 (cross-attn)':>{W}}"
+header = f"{'Metric':18s}  {'Stage 1 (comments)':>{W}}  {'Stage 2 (cross-attn)':>{W}}"
 if stage1_metrics:
-    header += f"  {'Δ (S2 - S1)':>{W}}"
+    header += f"{'Δ (S2 - S1)':>{W}}"
 print(header)
 print("  " + "-" * (len(header) - 2))
 
@@ -945,12 +941,12 @@ print("  " + "-" * (len(header) - 2))
 if stage1_metrics:
     delta_f1 = test_metrics['f1'] - stage1_metrics['f1']
     if delta_f1 > 0.01:
-        print(f"\n  ✅ Cross-attention context improves macro-F1 by +{delta_f1:.4f}")
+        print(f"\nCross-attention context improves macro-F1 by +{delta_f1:.4f}")
     elif delta_f1 < -0.01:
-        print(f"\n  ⚠️  Baseline is better by {abs(delta_f1):.4f} — "
+        print(f"\nBaseline is better by {abs(delta_f1):.4f} — "
               f"try more epochs or reduce MAX_CHUNKS")
     else:
-        print(f"\n  ↔️  Roughly equivalent (Δ macro-F1 = {delta_f1:+.4f})")
+        print(f"\nRoughly equivalent (Δ macro-F1 = {delta_f1:+.4f})")
 
     comp_rows = [{'metric': m,
                   'stage1_comments_only':    stage1_metrics[m],
@@ -966,18 +962,18 @@ if stage1_metrics:
 
 # ==================== FINAL SUMMARY ====================
 print("\n" + "=" * 80)
-print("🎉 STAGE 2 (CROSS-ATTENTION CONTEXT-AWARE) COMPLETE!")
+print("STAGE 2 (CROSS-ATTENTION CONTEXT-AWARE) COMPLETE!")
 print("=" * 80)
 print(f"\nOutputs in: {OUTPUT_DIR}/")
-print(f"  final_model/                — weights, bert config, label map, arch config")
-print(f"  label_mapping.csv           — id ↔ sentiment name")
-print(f"  per_class_metrics_test.csv  — per-class breakdown")
-print(f"  predictions_test.csv        — test predictions + body snippet")
-print(f"  confusion_matrix_test.csv   — confusion matrix")
-print(f"  stage_comparison.csv        — Stage 1 vs Stage 2 delta table")
+print(f"final_model/                — weights, bert config, label map, arch config")
+print(f"label_mapping.csv           — id ↔ sentiment name")
+print(f"per_class_metrics_test.csv  — per-class breakdown")
+print(f"predictions_test.csv        — test predictions + body snippet")
+print(f"confusion_matrix_test.csv   — confusion matrix")
+print(f"stage_comparison.csv        — Stage 1 vs Stage 2 delta table")
 
 if USE_WANDB:
-    print(f"\n📊 Full results: {wandb.run.get_url()}")
+    print(f"\nFull results: {wandb.run.get_url()}")
     _wandb_url = wandb.run.get_url()
     wandb.finish()
 else:
