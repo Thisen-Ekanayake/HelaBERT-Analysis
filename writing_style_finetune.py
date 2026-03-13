@@ -8,18 +8,18 @@ Architecture:
   │  Article body → sliding window (512 tok, stride 256, 50% overlap)        │
   │               → BERT encoder per chunk → [CLS] vectors                   │
   │               → chunk_matrix  [B, MAX_CHUNKS, H]                         │
-  │                                                                          │
+  │                                                                           │
   │  Comment text → BERT encoder → [CLS] → comment_vec  [B, H]               │
-  │                                                                          │
-  │  Cross-Attention:                                                        │
-  │    Query  = comment_vec  [B, 1, H]                                       │
-  │    Key    = chunk_matrix [B, MAX_CHUNKS, H]                              │
-  │    Value  = chunk_matrix [B, MAX_CHUNKS, H]                              │
-  │    → attended_context    [B, H]                                          │
-  │                                                                          │
-  │  Fusion:                                                                 │
-  │    [comment_vec ; attended_ctx ; comment_vec ⊙ attended_ctx]            │
-  │    → LayerNorm → Dropout → Linear → num_labels                           │
+  │                                                                           │
+  │  Cross-Attention:                                                         │
+  │    Query  = comment_vec  [B, 1, H]                                        │
+  │    Key    = chunk_matrix [B, MAX_CHUNKS, H]                               │
+  │    Value  = chunk_matrix [B, MAX_CHUNKS, H]                               │
+  │    → attended_context    [B, H]                                           │
+  │                                                                           │
+  │  Fusion:                                                                  │
+  │    [comment_vec ; attended_ctx ; comment_vec ⊙ attended_ctx]             │
+  │    → LayerNorm → Dropout → Linear → num_labels                            │
   └──────────────────────────────────────────────────────────────────────────┘
 
   Both encoders share the same BERT weights (weight-tied).
@@ -87,6 +87,99 @@ import random
 import wandb
 from dotenv import load_dotenv
 
+
+# ==================== LOAD ENVIRONMENT VARIABLES ====================
+load_dotenv()
+
+
+# ==================== EMAIL NOTIFICATION SETUP ====================
+
+EMAIL_NOTIFICATIONS_ENABLED = os.getenv("EMAIL_NOTIFICATIONS_ENABLED", "true").lower() == "true"
+EMAIL_SENDER      = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD    = os.getenv("EMAIL_APP_PASSWORD")
+EMAIL_RECIPIENT   = os.getenv("EMAIL_RECIPIENT")
+EMAIL_SMTP_HOST   = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
+EMAIL_SMTP_PORT   = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+TRAINING_JOB_NAME = os.getenv("TRAINING_writing_style", "BERT Writing Style — Context-Aware 5-Fold CV")
+
+
+def send_email_notification(subject: str, body_html: str, body_text: str = None):
+    """Send an email notification. Silently skips if email is not configured."""
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        print("ℹ️  Email notifications disabled (EMAIL_NOTIFICATIONS_ENABLED=false)")
+        return
+    if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECIPIENT]):
+        print("⚠️  Email notification skipped — EMAIL_SENDER, EMAIL_APP_PASSWORD, "
+              "or EMAIL_RECIPIENT not set in .env")
+        return
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = EMAIL_SENDER
+        msg["To"]      = EMAIL_RECIPIENT
+        if body_text:
+            msg.attach(MIMEText(body_text, "plain"))
+        msg.attach(MIMEText(body_html, "html"))
+        with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
+        print(f"✉️  Notification email sent to: {EMAIL_RECIPIENT}")
+    except Exception as e:
+        print(f"⚠️  Failed to send email notification: {e}")
+
+
+def _build_cv_success_email(cv_summary: dict, wandb_group_url: str = None) -> tuple:
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = "".join(
+        f"<tr><td style='padding:4px 12px'>{k}</td>"
+        f"<td style='padding:4px 12px'><b>{v if isinstance(v, str) else f'{v:.4f}'}</b></td></tr>"
+        for k, v in cv_summary.items()
+    )
+    wandb_section = f'<p>📊 <a href="{wandb_group_url}">View W&B group</a></p>' if wandb_group_url else ""
+    html = f"""
+    <html><body style='font-family:Arial,sans-serif;color:#222'>
+      <h2 style='color:#2e7d32'>✅ 5-Fold CV Training Complete</h2>
+      <p><b>Job:</b> {TRAINING_JOB_NAME}</p>
+      <p><b>Finished at:</b> {timestamp}</p>
+      <h3>Cross-Validation Summary</h3>
+      <table border='1' cellspacing='0' cellpadding='0' style='border-collapse:collapse;font-size:14px'>
+        <tr style='background:#e8f5e9'><th style='padding:6px 12px'>Metric</th><th style='padding:6px 12px'>Value</th></tr>
+        {rows}
+      </table>
+      {wandb_section}
+      <p style='color:#888;font-size:12px'>Sent by writing_style_finetune.py</p>
+    </body></html>"""
+    plain = (
+        f"5-Fold CV Complete\nJob: {TRAINING_JOB_NAME}\nFinished at: {timestamp}\n\n"
+        + "\n".join(f"{k}: {v}" for k, v in cv_summary.items())
+        + (f"\n\nW&B: {wandb_group_url}" if wandb_group_url else "")
+    )
+    return f"✅ 5-Fold CV Complete — {TRAINING_JOB_NAME}", html, plain
+
+
+def _build_failure_email(error: Exception, tb_str: str, fold: int = None) -> tuple:
+    timestamp  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fold_label = f" (Fold {fold})" if fold is not None else ""
+    tb_escaped = tb_str.replace("<", "&lt;").replace(">", "&gt;")
+    html = f"""
+    <html><body style='font-family:Arial,sans-serif;color:#222'>
+      <h2 style='color:#c62828'>❌ Training Crashed{fold_label}</h2>
+      <p><b>Job:</b> {TRAINING_JOB_NAME}</p>
+      <p><b>Crashed at:</b> {timestamp}</p>
+      <p><b>Error:</b> <span style='color:#c62828'>{type(error).__name__}: {error}</span></p>
+      <h3>Traceback</h3>
+      <pre style='background:#f5f5f5;padding:12px;font-size:12px;overflow:auto'>{tb_escaped}</pre>
+      <p style='color:#888;font-size:12px'>Sent by writing_style_finetune.py</p>
+    </body></html>"""
+    plain = (
+        f"Training Crashed{fold_label}\nJob: {TRAINING_JOB_NAME}\n\n"
+        f"{type(error).__name__}: {error}\n\n{tb_str}"
+    )
+    return f"❌ Training Crashed{fold_label} — {TRAINING_JOB_NAME}", html, plain
+
+
 # ==================== CONFIGURATION ====================
 print("=" * 80)
 print("BERT FINE-TUNING FOR WRITING STYLE CLASSIFICATION — 5-FOLD CV  [CONTEXT-AWARE CROSS-ATTENTION]")
@@ -111,13 +204,13 @@ CROSS_ATTN_DROPOUT = 0.1
 
 # Training Parameters  (NUM_LABELS is auto-detected from data)
 COMMENT_MAX_LENGTH           = 512   # writing style needs full comment context
-TRAIN_BATCH_SIZE             = 16     # lower: MAX_CHUNKS+1 BERT passes per sample
+TRAIN_BATCH_SIZE             = 4     # lower: MAX_CHUNKS+1 BERT passes per sample
 EVAL_BATCH_SIZE              = 8
 LEARNING_RATE                = 3e-5
 NUM_EPOCHS                   = 4     # early stopping decides actual stop point
 WARMUP_RATIO                 = 0.06
 WEIGHT_DECAY                 = 0.01
-GRADIENT_ACCUMULATION_STEPS  = 4     # effective batch = 64
+GRADIENT_ACCUMULATION_STEPS  = 4     # effective batch = 16
 EARLY_STOPPING_PATIENCE      = 3
 
 # Cross-validation
@@ -134,7 +227,8 @@ STAGE_TAG      = "cross_attention"
 
 # Misc
 RANDOM_SEED = 42
-USE_FP16    = True
+USE_FP16    = False  # AMD MI300X: use bf16 instead
+USE_BF16    = True
 NUM_WORKERS = 2
 
 # Weights & Biases
@@ -562,7 +656,10 @@ class MultiHeadCrossAttention(nn.Module):
                 key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf')
             )
 
-        weights  = self.dropout(F.softmax(scores, dim=-1))           # [B, h, 1, C]
+        # Guard: all-masked rows (empty body) → softmax(-inf,...) = NaN → kills grads
+        weights  = F.softmax(scores, dim=-1)                          # [B, h, 1, C]
+        weights  = torch.nan_to_num(weights, nan=0.0)                 # replace NaN with 0
+        weights  = self.dropout(weights)
         attended = torch.matmul(weights, V).squeeze(2)               # [B, h, d]
         attended = attended.transpose(1, 2).contiguous().view(B, -1) # [B, H]
         return self.out_proj(attended)
@@ -662,7 +759,7 @@ class CrossAttnTrainer(Trainer):
         outputs = model(**inputs)
         logits  = outputs.get("logits")
         if self.class_weights is not None:
-            loss_fn = nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device))
+            loss_fn = nn.CrossEntropyLoss(weight=self.class_weights.to(device=logits.device, dtype=logits.dtype))
         else:
             loss_fn = nn.CrossEntropyLoss()
         loss = loss_fn(logits, labels)
@@ -781,7 +878,8 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
                 "effective_batch":         TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
                 "warmup_ratio":            WARMUP_RATIO,
                 "weight_decay":            WEIGHT_DECAY,
-                "fp16":                    USE_FP16 and torch.cuda.is_available(),
+                "fp16":                    USE_FP16 and torch.cuda.is_available() and not USE_BF16,
+                "bf16":                    USE_BF16 and torch.cuda.is_available(),
                 "train_samples_balanced":  len(fold_train_texts),
                 "val_samples":             len(fold_val_texts),
                 **{f"class_weight_{id_to_label[i]}": fold_weights[i].item()
@@ -816,7 +914,8 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         metric_for_best_model="eval_f1",
         greater_is_better=True,
         save_total_limit=2,
-        fp16=USE_FP16 and torch.cuda.is_available(),
+        fp16=USE_FP16 and torch.cuda.is_available() and not USE_BF16,
+        bf16=USE_BF16 and torch.cuda.is_available(),
         dataloader_num_workers=0,   # CrossAttnTrainer handles DataLoaders internally
         seed=RANDOM_SEED + fold_idx,
         report_to="wandb" if USE_WANDB else "none",
@@ -852,10 +951,22 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         print(f"\n  ⚠️  Interrupted at fold {fold_idx}.")
         os.makedirs(f"{fold_output_dir}/interrupted_model", exist_ok=True)
         torch.save(model.state_dict(), f"{fold_output_dir}/interrupted_model/pytorch_model.bin")
+        if USE_WANDB:
+            wandb.finish(exit_code=1)
+        _s, _h, _p = _build_failure_email(
+            KeyboardInterrupt("Manually interrupted"), "User interrupted training.", fold=fold_idx
+        )
+        send_email_notification(_s, _h, _p)
+        raise
 
     except Exception as e:
         tb = traceback.format_exc()
         print(f"\n  ❌ Fold {fold_idx} failed: {e}")
+        if USE_WANDB:
+            wandb.finish(exit_code=1)
+        _s, _h, _p = _build_failure_email(e, tb, fold=fold_idx)
+        send_email_notification(_s, _h, _p)
+        raise
 
     # ── Evaluate ───────────────────────────────────────────────────────────────
     print(f"\n  Evaluating fold {fold_idx}...")
@@ -1193,3 +1304,7 @@ print(f"  oof_predictions.csv            out-of-fold predictions (full dataset)"
 print(f"  oof_confusion_matrix.csv       OOF confusion matrix")
 if USE_WANDB and wandb_group_url:
     print(f"\n📊 W&B group: {wandb_group_url}")
+
+# ==================== SEND COMPLETION EMAIL ====================
+_s, _h, _p = _build_cv_success_email(cv_summary, wandb_group_url if USE_WANDB else None)
+send_email_notification(_s, _h, _p)
