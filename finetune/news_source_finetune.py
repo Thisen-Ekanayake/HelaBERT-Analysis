@@ -45,9 +45,7 @@ Expected CSV format:
 """
 
 import os
-import smtplib
 import traceback
-import datetime
 from collections import Counter
 import random as stdlib_random
 from email.mime.multipart import MIMEMultipart
@@ -73,7 +71,6 @@ from sklearn.metrics import (
 )
 from transformers import (
     BertConfig,
-    BertForSequenceClassification,
     BertForMaskedLM,
     BertModel,
     Trainer,
@@ -84,7 +81,6 @@ from transformers import (
 from transformers.modeling_outputs import SequenceClassifierOutput
 import random
 import wandb
-from dotenv import load_dotenv
 
 # ==================== CONFIGURATION ====================
 print("=" * 80)
@@ -99,12 +95,12 @@ BERT_CONFIG_FILE = "HelaBERT/config.json"
 # Dataset Path
 DATA_PATH = "data/Sinhala-News-Source-classification/train/news_source_train.csv"
 
-# ── Sliding window (article body → chunks) ─────────────────────────────────
+# ==================== Sliding window (article body → chunks) ====================
 CHUNK_SIZE   = 512    # tokens per chunk
 CHUNK_STRIDE = 256    # 50% overlap
 MAX_CHUNKS   = 16     # cap per article — reduce to 8 if OOM
 
-# ── Cross-attention ────────────────────────────────────────────────────────
+# ==================== Cross-attention ====================
 CROSS_ATTN_HEADS   = 8     # must divide hidden_size (768/8 = 96 per head)
 CROSS_ATTN_DROPOUT = 0.1
 
@@ -171,7 +167,7 @@ if torch.cuda.is_available():
     print(f"CUDA device:     {torch.cuda.get_device_name(0)}")
     print(f"CUDA version:    {torch.version.cuda}")
 else:
-    print("⚠️  Running on CPU — training will be slower")
+    print("Running on CPU — training will be slower")
 
 
 # ==================== VERIFY PATHS ====================
@@ -179,9 +175,9 @@ print("\n" + "=" * 80)
 print("VERIFYING PATHS")
 print("=" * 80)
 
-assert os.path.exists(BERT_MODEL_PATH),  f"❌ Model path not found: {BERT_MODEL_PATH}"
-assert os.path.exists(TOKENIZER_MODEL),  f"❌ Tokenizer not found: {TOKENIZER_MODEL}"
-assert os.path.exists(DATA_PATH),        f"❌ Data file not found: {DATA_PATH}"
+assert os.path.exists(BERT_MODEL_PATH),  f"Model path not found: {BERT_MODEL_PATH}"
+assert os.path.exists(TOKENIZER_MODEL),  f"Tokenizer not found: {TOKENIZER_MODEL}"
+assert os.path.exists(DATA_PATH),        f"Data file not found: {DATA_PATH}"
 
 print("✓ All required paths verified")
 
@@ -222,7 +218,7 @@ print("=" * 80)
 try:
     df = pd.read_csv(DATA_PATH)
 except pd.errors.ParserError:
-    print("⚠️  CSV has formatting issues, using error-tolerant parsing...")
+    print("CSV has formatting issues, using error-tolerant parsing...")
     df = pd.read_csv(DATA_PATH, engine='python', on_bad_lines='skip')
     print("✓ Loaded with some lines skipped")
 
@@ -246,7 +242,7 @@ if possible_comment_cols and possible_label_cols:
         print(f"✓ Identified body column:    '{possible_body_cols[0]}'")
     df = df.rename(columns=rename)
 else:
-    print("⚠️  Could not automatically identify columns — assuming col1=comment, col2=label")
+    print("Could not automatically identify columns — assuming col1=comment, col2=label")
     df = df.iloc[:, -2:]
     df.columns = ['comment', 'label']
 
@@ -257,7 +253,7 @@ df['comment'] = df['comment'].astype(str).str.strip()
 
 # Fill body column — fall back to empty string (comment-only mode)
 if 'body' not in df.columns:
-    print("⚠️  No 'body' column found — using comment-only mode (single dummy chunk)")
+    print("No 'body' column found — using comment-only mode (single dummy chunk)")
     df['body'] = ''
 else:
     df['body'] = df['body'].fillna('').astype(str).str.strip()
@@ -272,7 +268,7 @@ print(f"  - Shape:         {df.shape}")
 
 missing_values = df.isnull().sum()
 if missing_values.sum() > 0:
-    print(f"\n⚠️  Missing values found — dropping affected rows")
+    print(f"\nMissing values found — dropping affected rows")
     df = df.dropna()
     print(f"  - Remaining samples: {len(df)}")
 else:
@@ -291,7 +287,7 @@ print(f"\nUnique labels found: {actual_num_labels}")
 print(f"Label range: {df['label'].min()} to {df['label'].max()}")
 
 if actual_num_labels != NUM_LABELS:
-    print(f"⚠️  Updating NUM_LABELS from {NUM_LABELS} to {actual_num_labels}")
+    print(f"Updating NUM_LABELS from {NUM_LABELS} to {actual_num_labels}")
     NUM_LABELS = actual_num_labels
 
 print("\n" + "-" * 80)
@@ -338,8 +334,8 @@ if has_bodies > 0:
     avg_chunks = bl.apply(
         lambda l: min(math.ceil(max(l - CHUNK_SIZE, 0) / CHUNK_STRIDE) + 1, MAX_CHUNKS)
     ).mean()
-    print(f"\n  Avg chunks/article (capped {MAX_CHUNKS}): {avg_chunks:.1f}")
-    print(f"  Overlap per boundary: {CHUNK_SIZE - CHUNK_STRIDE} tokens")
+    print(f"\nAvg chunks/article (capped {MAX_CHUNKS}): {avg_chunks:.1f}")
+    print(f"Overlap per boundary: {CHUNK_SIZE - CHUNK_STRIDE} tokens")
 
 
 # ==================== SLIDING WINDOW CHUNKER ====================
@@ -406,14 +402,14 @@ class CrossAttnNewsSourceDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        # ── Article body → chunks ──────────────────────────────────────────
+        # ==================== Article body → chunks ====================
         chunks, num_real = tokenize_chunks(
             self.bodies[idx], self.chunk_size, self.chunk_stride, self.max_chunks
         )
         chunk_ids  = torch.stack([c[0] for c in chunks])   # [MAX_CHUNKS, CHUNK_SIZE]
         chunk_mask = torch.stack([c[1] for c in chunks])   # [MAX_CHUNKS, CHUNK_SIZE]
 
-        # ── Comment → query ────────────────────────────────────────────────
+        # ==================== Comment → query ====================
         c_ids  = self.sp.encode(self.texts[idx])[:self.comment_max_length]
         c_mask = [1] * len(c_ids)
         pad    = self.comment_max_length - len(c_ids)
@@ -652,25 +648,25 @@ def load_fresh_model(bert_model_path, bert_config_file, num_labels):
     """Load a fresh shared-BERT cross-attention model for each fold."""
     if os.path.exists(bert_config_file):
         bert_config = BertConfig.from_json_file(bert_config_file)
-        print(f"  ✓ Config from {bert_config_file}")
+        print(f"✓ Config from {bert_config_file}")
     else:
         try:
             bert_config = BertConfig.from_pretrained(bert_model_path)
-            print("  ✓ Config from model dir")
+            print("✓ Config from model dir")
         except Exception:
             bert_config = None
-            print("  ⚠️  Config not found — using defaults")
+            print("Config not found — using defaults")
 
     try:
         bert_backbone = BertModel.from_pretrained(bert_model_path)
-        print("  ✓ BertModel loaded")
+        print("✓ BertModel loaded")
     except Exception as e:
-        print(f"  BertModel failed ({e}), extracting from MLM checkpoint...")
+        print(f"BertModel failed ({e}), extracting from MLM checkpoint...")
         mlm           = BertForMaskedLM.from_pretrained(bert_model_path)
         bert_backbone = mlm.bert
         if bert_config is None:
             bert_config = mlm.config
-        print("  ✓ BERT encoder extracted from MLM checkpoint")
+        print("✓ BERT encoder extracted from MLM checkpoint")
 
     hidden_size = (bert_config.hidden_size if bert_config
                    else bert_backbone.config.hidden_size)
@@ -722,7 +718,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
     fold_output_dir = f"{OUTPUT_DIR}/fold_{fold_idx}"
     os.makedirs(fold_output_dir, exist_ok=True)
 
-    # ── Split ──────────────────────────────────────────────────────────────
+    # ==================== Split ====================
     fold_train_texts  = [all_texts[i]  for i in train_idx]
     fold_train_bodies = [all_bodies[i] for i in train_idx]
     fold_train_labels = [all_labels[i] for i in train_idx]
@@ -730,13 +726,13 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
     fold_val_bodies   = [all_bodies[i] for i in val_idx]
     fold_val_labels   = [all_labels[i] for i in val_idx]
 
-    print(f"  Train: {len(fold_train_texts)} samples  |  Val: {len(fold_val_texts)} samples")
+    print(f"Train: {len(fold_train_texts)} samples  |  Val: {len(fold_val_texts)} samples")
 
-    print("  Train label distribution (before oversampling):")
+    print("Train label distribution (before oversampling):")
     for lbl, cnt in sorted(Counter(fold_train_labels).items()):
-        print(f"    Label {lbl}: {cnt}")
+        print(f"Label {lbl}: {cnt}")
 
-    # ── Oversample (train only) ────────────────────────────────────────────
+    # ==================== Oversample (train only) ====================
     if OVERSAMPLE_TRAIN:
         fold_train_texts, fold_train_bodies, fold_train_labels = oversample(
             fold_train_texts, fold_train_bodies, fold_train_labels, seed=RANDOM_SEED + fold_idx
@@ -746,15 +742,15 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         for lbl, cnt in sorted(Counter(fold_train_labels).items()):
             print(f"    Label {lbl}: {cnt}")
 
-    # ── Class weights (computed from raw pre-oversample distribution) ──────
+    # Class weights (computed from raw pre-oversample distribution)
     raw_fold_labels = [all_labels[i] for i in train_idx]
     fold_weights    = compute_class_weights(raw_fold_labels, NUM_LABELS)
     if USE_CLASS_WEIGHTS:
-        print("  Class weights:")
+        print("Class weights:")
         for i, w in enumerate(fold_weights):
-            print(f"    Label {i}: {w.item():.4f}")
+            print(f"Label {i}: {w.item():.4f}")
 
-    # ── Datasets ──────────────────────────────────────────────────────────
+    # ==================== Datasets ====================
     train_ds = CrossAttnNewsSourceDataset(
         fold_train_texts, fold_train_bodies, fold_train_labels, sp,
         comment_max_length=COMMENT_MAX_LENGTH,
@@ -766,14 +762,14 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         chunk_size=CHUNK_SIZE, chunk_stride=CHUNK_STRIDE, max_chunks=MAX_CHUNKS,
     )
 
-    # ── Fresh model ────────────────────────────────────────────────────────
-    print(f"  Loading fresh model for fold {fold_idx}...")
+    # ==================== Fresh model ====================
+    print(f"Loading fresh model for fold {fold_idx}...")
     model, bert_config, hidden_size = load_fresh_model(BERT_MODEL_PATH, BERT_CONFIG_FILE, NUM_LABELS)
     total_p     = sum(p.numel() for p in model.parameters())
     trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Parameters: {total_p:,} total, {trainable_p:,} trainable")
+    print(f"Parameters: {total_p:,} total, {trainable_p:,} trainable")
 
-    # ── W&B (one run per fold, all in the same group) ─────────────────────
+    # W&B (one run per fold, all in the same group)
     wandb_run_name = f"fold_{fold_idx}_of_{N_FOLDS}"
     if USE_WANDB:
         if wandb.run is not None:
@@ -816,7 +812,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
             wandb_group_url = f"https://wandb.ai/{run.entity}/{WANDB_PROJECT}/groups/{WANDB_GROUP}"
         print(f"  W&B run: {run.get_url()}")
 
-    # ── Training args ──────────────────────────────────────────────────────
+    # Training args
     training_args = TrainingArguments(
         output_dir=fold_output_dir,
         num_train_epochs=NUM_EPOCHS,
@@ -843,7 +839,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         push_to_hub=False,
     )
 
-    # ── Trainer ────────────────────────────────────────────────────────────
+    # ==================== Trainer ====================
     early_stop = EarlyStoppingCallback(early_stopping_patience=EARLY_STOPPING_PATIENCE)
 
     trainer = CrossAttnTrainer(
@@ -853,31 +849,31 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         compute_metrics=compute_metrics, callbacks=[early_stop],
     )
 
-    # ── Train ──────────────────────────────────────────────────────────────
+    # ==================== Train ====================
     try:
         train_result = trainer.train()
-        print(f"\n  Fold {fold_idx} training complete.")
+        print(f"\nFold {fold_idx} training complete.")
         for k, v in train_result.metrics.items():
             print_metric(k, v)
 
     except KeyboardInterrupt:
-        print(f"\n  ⚠️  Interrupted at fold {fold_idx}.")
+        print(f"\nInterrupted at fold {fold_idx}.")
         os.makedirs(f"{fold_output_dir}/interrupted_model", exist_ok=True)
         torch.save(model.state_dict(), f"{fold_output_dir}/interrupted_model/pytorch_model.bin")
 
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"\n  ❌ Fold {fold_idx} failed: {e}")
+        print(f"\nFold {fold_idx} failed: {e}")
 
-    # ── Evaluate ───────────────────────────────────────────────────────────
-    print(f"\n  Evaluating fold {fold_idx}...")
+    # ==================== Evaluate ====================
+    print(f"\nEvaluating fold {fold_idx}...")
     eval_results = trainer.evaluate()
-    print(f"  Fold {fold_idx} eval metrics:")
+    print(f"Fold {fold_idx} eval metrics:")
     for k, v in eval_results.items():
         if isinstance(v, float):
             print(f"    {k}: {v:.4f}")
 
-    # ── Predictions & per-class report ────────────────────────────────────
+    # ==================== Predictions & per-class report ====================
     preds_out = trainer.predict(val_ds)
     y_pred    = np.argmax(preds_out.predictions, axis=-1)
     y_true    = np.array(fold_val_labels)
@@ -886,10 +882,10 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
     all_y_pred.extend(y_pred.tolist())
     all_oof_texts.extend(fold_val_texts)
 
-    print(f"\n  Classification report — Fold {fold_idx}:")
+    print(f"\nClassification report — Fold {fold_idx}:")
     print(classification_report(y_true, y_pred, digits=4))
 
-    # ── Save per-fold predictions ──────────────────────────────────────────
+    # ==================== Save per-fold predictions ====================
     fold_conf = [
         torch.softmax(torch.tensor(preds_out.predictions[i]), dim=0)[y_pred[i]].item()
         for i in range(len(y_pred))
@@ -902,7 +898,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         'confidence':      fold_conf,
     }).to_csv(f"{fold_output_dir}/predictions.csv", index=False)
 
-    # ── Per-class metrics ──────────────────────────────────────────────────
+    # ==================== Per-class metrics ====================
     prec_pc, rec_pc, f1_pc, sup_pc = precision_recall_fscore_support(
         y_true, y_pred, average=None, zero_division=0
     )
@@ -922,7 +918,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         columns=[f"Pred_{i}" for i in range(NUM_LABELS)],
     ).to_csv(f"{fold_output_dir}/confusion_matrix.csv")
 
-    # ── Store fold-level metrics ───────────────────────────────────────────
+    # ==================== Store fold-level metrics ====================
     fold_m = {
         'fold':        fold_idx,
         'accuracy':    eval_results['eval_accuracy'],
@@ -933,7 +929,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
     }
     fold_metrics.append(fold_m)
 
-    # ── W&B fold summary ──────────────────────────────────────────────────
+    # ==================== W&B fold summary ====================
     if USE_WANDB:
         wandb.log({
             "fold_summary/accuracy":    fold_m['accuracy'],
@@ -961,9 +957,9 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         except ImportError:
             pass
         wandb.finish()
-        print(f"  ✓ W&B fold {fold_idx} run finished")
+        print(f"✓ W&B fold {fold_idx} run finished")
 
-    # ── Save best model ────────────────────────────────────────────────────
+    # ==================== Save best model ====================
     if fold_m['f1'] > best_fold_f1:
         best_fold_f1  = fold_m['f1']
         best_fold_idx = fold_idx
@@ -977,12 +973,12 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
             'chunk_size': CHUNK_SIZE, 'chunk_stride': CHUNK_STRIDE,
             'max_chunks': MAX_CHUNKS, 'comment_max_length': COMMENT_MAX_LENGTH,
         }]).to_csv(f"{BEST_MODEL_DIR}/arch_config.csv", index=False)
-        print(f"\n  ★ New best model saved (fold {fold_idx}, F1={best_fold_f1:.4f}) → {BEST_MODEL_DIR}")
+        print(f"\nNew best model saved (fold {fold_idx}, F1={best_fold_f1:.4f}) → {BEST_MODEL_DIR}")
 
-    print(f"\n  Fold {fold_idx} done — macro F1: {fold_m['f1']:.4f}")
+    print(f"\nFold {fold_idx} done — macro F1: {fold_m['f1']:.4f}")
 
-    # ── Cross-attention weight inspection (last fold's model, 5 val samples) ──
-    print(f"\n  Cross-attention weight inspection (fold {fold_idx}, 5 samples):")
+    # Cross-attention weight inspection (last fold's model, 5 val samples)
+    print(f"\nCross-attention weight inspection (fold {fold_idx}, 5 samples):")
     model.eval()
     device    = next(model.parameters()).device
     attn_rows = []
@@ -1020,8 +1016,8 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
             pred_lbl     = str(int(all_y_pred[-(len(val_ds) - si)]))
             correct_sym  = "✓" if fold_val_labels[si] == int(all_y_pred[-(len(val_ds) - si)]) else "✗"
 
-            print(f"    Sample {si+1} [{correct_sym}]  True: {true_lbl}  Pred: {pred_lbl}")
-            print(f"      Comment: {comment_text}...")
+            print(f"Sample {si+1} [{correct_sym}]  True: {true_lbl}  Pred: {pred_lbl}")
+            print(f"Comment: {comment_text}...")
             for ci, w in enumerate(chunk_importance):
                 bar = "█" * int(w * 30)
                 print(f"      chunk {ci:2d}: {w:.4f}  {bar}")
@@ -1039,7 +1035,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         attn_df.to_csv(f"{fold_output_dir}/cross_attn_weights.csv", index=False)
         if USE_WANDB:
             wandb.log({"cross_attention_weights": wandb.Table(dataframe=attn_df)})
-        print(f"  ✓ Attention weights saved → {fold_output_dir}/cross_attn_weights.csv")
+        print(f"✓ Attention weights saved → {fold_output_dir}/cross_attn_weights.csv")
 
     model.train()
 
@@ -1068,8 +1064,8 @@ for metric in ['accuracy', 'precision', 'recall', 'f1', 'f1_weighted']:
     ci_hi = m + 1.96 * s / (N_FOLDS ** 0.5)
     print(f"  {metric:<18} {m:>10.4f} {s:>10.4f}   [{ci_lo:.4f}, {ci_hi:.4f}]")
 print("-" * 60)
-print(f"\n  Best single fold: Fold {best_fold_idx}  (macro F1 = {best_fold_f1:.4f})")
-print(f"  Best model saved to: {BEST_MODEL_DIR}")
+print(f"\nBest single fold: Fold {best_fold_idx}  (macro F1 = {best_fold_f1:.4f})")
+print(f"Best model saved to: {BEST_MODEL_DIR}")
 
 
 # ==================== OUT-OF-FOLD (OOF) REPORT ====================
@@ -1186,15 +1182,15 @@ for k, v in cv_summary.items():
     print(f"  {k:<28}: {v}")
 
 print("\n" + "=" * 80)
-print("🎉 5-FOLD CROSS-VALIDATION (CONTEXT-AWARE CROSS-ATTENTION) COMPLETE!")
+print("5-FOLD CROSS-VALIDATION (CONTEXT-AWARE CROSS-ATTENTION) COMPLETE!")
 print("=" * 80)
 print(f"\nOutputs saved to: {OUTPUT_DIR}/")
-print(f"  fold_1/ … fold_{N_FOLDS}/      per-fold predictions, metrics, confusion matrix,")
+print(f"fold_1/ … fold_{N_FOLDS}/      per-fold predictions, metrics, confusion matrix,")
 print(f"                               cross_attn_weights.csv")
-print(f"  best_model/                    best model weights (fold {best_fold_idx})")
-print(f"  cv_fold_metrics.csv            per-fold metric table")
-print(f"  cv_summary.csv                 overall CV summary")
-print(f"  oof_predictions.csv            out-of-fold predictions (full dataset)")
-print(f"  oof_confusion_matrix.csv       OOF confusion matrix")
+print(f"best_model/                    best model weights (fold {best_fold_idx})")
+print(f"cv_fold_metrics.csv            per-fold metric table")
+print(f"cv_summary.csv                 overall CV summary")
+print(f"oof_predictions.csv            out-of-fold predictions (full dataset)")
+print(f"oof_confusion_matrix.csv       OOF confusion matrix")
 if USE_WANDB and wandb_group_url:
-    print(f"\n📊 W&B group: {wandb_group_url}")
+    print(f"\nW&B group: {wandb_group_url}")
