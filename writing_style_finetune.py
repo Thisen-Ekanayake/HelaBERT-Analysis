@@ -111,13 +111,13 @@ CROSS_ATTN_DROPOUT = 0.1
 
 # Training Parameters  (NUM_LABELS is auto-detected from data)
 COMMENT_MAX_LENGTH           = 512   # writing style needs full comment context
-TRAIN_BATCH_SIZE             = 4     # lower: MAX_CHUNKS+1 BERT passes per sample
+TRAIN_BATCH_SIZE             = 16     # lower: MAX_CHUNKS+1 BERT passes per sample
 EVAL_BATCH_SIZE              = 8
 LEARNING_RATE                = 3e-5
 NUM_EPOCHS                   = 4     # early stopping decides actual stop point
 WARMUP_RATIO                 = 0.06
 WEIGHT_DECAY                 = 0.01
-GRADIENT_ACCUMULATION_STEPS  = 4     # effective batch = 16
+GRADIENT_ACCUMULATION_STEPS  = 4     # effective batch = 64
 EARLY_STOPPING_PATIENCE      = 3
 
 # Cross-validation
