@@ -14,6 +14,7 @@ HelaBERT_finetuned_news_category_cv/
 HelaBERT_finetuned_news_source_cv/
 HelaBERT_finetuned_writing_style_cv/
 HelaBERT_sentiment_comments_cv/
+HelaBERT_sentiment_crossattn_cv
 
 eval_results_news_category/
 eval_results_news_source/
