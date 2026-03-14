@@ -1,5 +1,7 @@
 """
-BERT Fine-tuning for Sentiment Analysis — Stage 2: Context-Aware (Cross-Attention)
+BERT Fine-tuning for Sentiment Analysis — 5-Fold Cross Validation
+— Balanced training via oversampling + weighted loss —
+— Stage 2: Context-Aware (Cross-Attention) —
 
 Architecture:
   ┌──────────────────────────────────────────────────────────────────────────┐
@@ -24,14 +26,25 @@ Architecture:
   The element-wise product captures interaction between what the commenter said
   and which part of the article they are responding to.
 
-  At the end, cross-attention weights are inspected on a few test samples so
-  you can see which article chunks the model focused on per comment.
-  A full Stage 1 vs Stage 2 comparison table is printed and saved.
+Cross-validation strategy:
+  • StratifiedKFold(n_splits=5) over the combined train+test pool
+  • Oversampling applied ONLY to each fold's training split (never the val split)
+  • Class weights recomputed per fold from that fold's raw training distribution
+  • Fresh model loaded at the start of every fold
+  • Best model across all folds (highest val macro-F1) is saved as the final model
+  • Mean ± std reported across all folds at the end
+  • Cross-attention weights inspected on 5 val samples per fold
+
+Expected CSV columns (via BODY_COL / COMMENT_COL / LABEL_COL config):
+    body, comment_phrase, comment_sentiment
 """
 
 import os
 import traceback
 import math
+import random as stdlib_random
+from collections import Counter
+
 import numpy as np
 import pandas as pd
 import torch
@@ -40,15 +53,16 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import sentencepiece as spm
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
     classification_report, confusion_matrix,
     precision_recall_fscore_support
 )
-from sklearn.model_selection import train_test_split
 from transformers import (
     BertConfig, BertModel, BertForMaskedLM,
-    Trainer, TrainingArguments, EvalPrediction
+    Trainer, TrainingArguments, EvalPrediction,
+    EarlyStoppingCallback,
 )
 from transformers.modeling_outputs import SequenceClassifierOutput
 import random
@@ -56,10 +70,10 @@ import wandb
 
 # ==================== CONFIGURATION ====================
 print("=" * 80)
-print("BERT SENTIMENT — STAGE 2: CROSS-ATTENTION CONTEXT-AWARE MODEL")
+print("BERT SENTIMENT — STAGE 2: CROSS-ATTENTION  [5-FOLD CROSS-VALIDATION]")
 print("=" * 80)
 
-# ==================== File paths ==================== 
+# ==================== File paths ====================
 BERT_MODEL_PATH  = "HelaBERT"
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT/config.json"
@@ -67,15 +81,12 @@ BERT_CONFIG_FILE = "HelaBERT/config.json"
 TRAIN_DATA_PATH  = "data/sinhala-sentiment-analysis/outputs/train.csv"
 TEST_DATA_PATH   = "data/sinhala-sentiment-analysis/outputs/test.csv"
 
-# Stage 1 predictions CSV for end-of-run comparison (set None to skip)
-STAGE1_PREDICTIONS_CSV = "HelaBERT_sentiment_comments_only/predictions_test.csv"
-
-# ==================== TSV column names ==================== 
+# ==================== TSV column names ====================
 BODY_COL    = "body"
 COMMENT_COL = "comment_phrase"
 LABEL_COL   = "comment_sentiment"
 
-# ==================== Sliding window ==================== 
+# ==================== Sliding window ====================
 CHUNK_SIZE   = 512    # tokens per chunk
 CHUNK_STRIDE = 256    # 50% overlap
 MAX_CHUNKS   = 16     # cap per article — reduce to 8 if OOM
@@ -83,52 +94,65 @@ MAX_CHUNKS   = 16     # cap per article — reduce to 8 if OOM
 # ==================== Sequence lengths ====================
 COMMENT_MAX_LENGTH = 256
 
-# ==================== Cross-attention ──────────────====================──────────────────────────────────────────────
+# ==================== Cross-attention ====================
 CROSS_ATTN_HEADS   = 8     # must divide hidden_size (768/8 = 96 per head)
 CROSS_ATTN_DROPOUT = 0.1
 
 # ==================== Training ====================
 TRAIN_BATCH_SIZE            = 4     # lower: MAX_CHUNKS+1 BERT passes per sample
 EVAL_BATCH_SIZE             = 8
-LEARNING_RATE               = 2e-5
-NUM_EPOCHS                  = 10
+LEARNING_RATE               = 3e-5
+NUM_EPOCHS                  = 3    # early stopping decides actual stop point
 WARMUP_RATIO                = 0.1
 WEIGHT_DECAY                = 0.05
 GRADIENT_ACCUMULATION_STEPS = 4     # effective batch = 16
-VAL_SPLIT                   = 0.1
+EARLY_STOPPING_PATIENCE     = 3
+
+# ==================== Cross-validation ====================
+N_FOLDS = 5
+
+# ==================== Balancing ====================
+OVERSAMPLE_TRAIN  = True
+USE_CLASS_WEIGHTS = True
 
 # ==================== Output ====================
-OUTPUT_DIR = "HelaBERT_sentiment_crossattn"
-STAGE_TAG  = "cross_attention"
+OUTPUT_DIR     = "HelaBERT_sentiment_crossattn_cv"
+BEST_MODEL_DIR = f"{OUTPUT_DIR}/best_model"
+STAGE_TAG      = "cross_attention"
 
 # ==================== Misc ====================
 RANDOM_SEED = 42
 USE_FP16    = True
+USE_BF16    = False
 NUM_WORKERS = 2
 
 # ==================== W&B ====================
-USE_WANDB         = True
-WANDB_PROJECT     = "bert-sentiment-analysis"
-WANDB_RUN_NAME    = f"bert_{STAGE_TAG}_lr{LEARNING_RATE}_bs{TRAIN_BATCH_SIZE}_ep{NUM_EPOCHS}"
-WANDB_ENTITY      = None
-WANDB_RUN_ID_FILE = f"wandb_run_id_{STAGE_TAG}.txt"
+USE_WANDB     = True
+WANDB_PROJECT = "bert-sentiment-analysis"
+WANDB_GROUP   = f"5fold_cv_crossattn_lr{LEARNING_RATE}_bs{TRAIN_BATCH_SIZE}"
+WANDB_ENTITY  = None
 
-print("\n✓ Configuration loaded")
-print(f"BERT model       : {BERT_MODEL_PATH}")
-print(f"Train data       : {TRAIN_DATA_PATH}")
-print(f"Test data        : {TEST_DATA_PATH}")
-print(f"Output dir       : {OUTPUT_DIR}")
-print(f"Chunk size/stride: {CHUNK_SIZE} / {CHUNK_STRIDE}  max chunks: {MAX_CHUNKS}")
-print(f"Cross-attn heads : {CROSS_ATTN_HEADS}")
-print(f"Effective batch  : {TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
+print(f"\n✓ Config loaded — {N_FOLDS}-fold CV, oversampling={'on' if OVERSAMPLE_TRAIN else 'off'}, "
+      f"class_weights={'on' if USE_CLASS_WEIGHTS else 'off'}")
+print(f"  Model path:        {BERT_MODEL_PATH}")
+print(f"  Tokenizer:         {TOKENIZER_MODEL}")
+print(f"  Train data:        {TRAIN_DATA_PATH}")
+print(f"  Test data:         {TEST_DATA_PATH}")
+print(f"  Output directory:  {OUTPUT_DIR}")
+print(f"  W&B logging:       {'Enabled' if USE_WANDB else 'Disabled'}")
+print(f"  Architecture:      shared BERT + {CROSS_ATTN_HEADS}-head cross-attention + interaction fusion")
+print(f"  Chunk size/stride: {CHUNK_SIZE}/{CHUNK_STRIDE}  max chunks: {MAX_CHUNKS}")
+print(f"  Effective batch:   {TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
 
 
 # ==================== SEEDS ====================
 random.seed(RANDOM_SEED)
+stdlib_random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(RANDOM_SEED)
+print("\n✓ Random seeds set for reproducibility")
 
 
 # ==================== ENVIRONMENT ====================
@@ -220,7 +244,6 @@ def tokenize_chunks(text, chunk_size, stride, max_chunks):
 
     num_real = max(len(chunks), 1)
 
-    # Pad up to max_chunks
     dummy_ids  = torch.full((chunk_size,), PAD_ID, dtype=torch.long)
     dummy_mask = torch.zeros(chunk_size,           dtype=torch.long)
     while len(chunks) < max_chunks:
@@ -242,9 +265,9 @@ print(f"✓ Train: {len(train_df):,}  Test: {len(test_df):,}")
 print("\n" + "=" * 80)
 print("ENCODING LABELS")
 print("=" * 80)
-all_labels = pd.concat([train_df['label'], test_df['label']]).unique()
+all_labels_raw = pd.concat([train_df['label'], test_df['label']]).unique()
 le = LabelEncoder()
-le.fit(sorted(all_labels))
+le.fit(sorted(all_labels_raw))
 train_df['label_id'] = le.transform(train_df['label'])
 test_df['label_id']  = le.transform(test_df['label'])
 NUM_LABELS  = len(le.classes_)
@@ -260,61 +283,71 @@ for idx, lbl in sorted(id_to_label.items()):
     print(f"  [{idx}] {lbl:20s}  train: {tr:5d}  test: {te:5d}")
 
 
+# ==================== BUILD CV POOL ====================
+# Combine train + test so CV folds are drawn from the full labelled dataset.
+# The held-out test fold acts as the validation set for that fold.
+print("\n" + "=" * 80)
+print("BUILDING CV POOL  (train + test combined)")
+print("=" * 80)
+full_df = pd.concat([train_df, test_df], ignore_index=True)
+print(f"✓ Total pool: {len(full_df):,} samples")
+print("Full dataset label distribution:")
+for idx, cnt in sorted(Counter(full_df['label_id'].tolist()).items()):
+    print(f"  [{idx}] {id_to_label[idx]:20s}: {cnt:6d} ({100*cnt/len(full_df):.1f}%)")
+
+all_texts  = full_df['comment'].tolist()
+all_bodies = full_df['body'].tolist()
+all_labels = full_df['label_id'].tolist()
+
+
 # ==================== BODY LENGTH ANALYSIS ====================
 print("\n" + "=" * 80)
 print("ARTICLE BODY LENGTH ANALYSIS")
 print("=" * 80)
-lengths = train_df['body'].apply(lambda x: len(sp.encode(x)))
-print(f"min    : {lengths.min():,}")
-print(f"mean   : {lengths.mean():.0f}")
-print(f"median : {lengths.median():.0f}")
-print(f"90th % : {lengths.quantile(0.90):.0f}")
-print(f"max    : {lengths.max():,}")
-avg_c = lengths.apply(
-    lambda l: min(math.ceil(max(l - CHUNK_SIZE, 0) / CHUNK_STRIDE) + 1, MAX_CHUNKS)
-).mean()
-print(f"\nAvg chunks/article (capped {MAX_CHUNKS}): {avg_c:.1f}")
-print(f"Overlap per boundary: {CHUNK_SIZE - CHUNK_STRIDE} tokens")
+lengths = full_df['body'].apply(lambda x: len(sp.encode(x)) if x else 0)
+has_bodies = (lengths > 0).sum()
+print(f"Samples with body text: {has_bodies:,} / {len(full_df):,}")
+if has_bodies > 0:
+    bl = lengths[lengths > 0]
+    print(f"min    : {bl.min():,}")
+    print(f"mean   : {bl.mean():.0f}")
+    print(f"median : {bl.median():.0f}")
+    print(f"90th % : {bl.quantile(0.90):.0f}")
+    print(f"max    : {bl.max():,}")
+    avg_c = bl.apply(
+        lambda l: min(math.ceil(max(l - CHUNK_SIZE, 0) / CHUNK_STRIDE) + 1, MAX_CHUNKS)
+    ).mean()
+    print(f"\nAvg chunks/article (capped {MAX_CHUNKS}): {avg_c:.1f}")
+    print(f"Overlap per boundary: {CHUNK_SIZE - CHUNK_STRIDE} tokens")
 
 
-# ==================== TRAIN / VAL SPLIT ====================
-print("\n" + "=" * 80)
-print("TRAIN / VALIDATION SPLIT")
-print("=" * 80)
-tr_idx, val_idx = train_test_split(
-    range(len(train_df)), test_size=VAL_SPLIT,
-    random_state=RANDOM_SEED, stratify=train_df['label_id'].tolist()
-)
-tr_df  = train_df.iloc[tr_idx].reset_index(drop=True)
-val_df = train_df.iloc[val_idx].reset_index(drop=True)
-print(f"Train: {len(tr_df):,}  Val: {len(val_df):,}  Test: {len(test_df):,}")
-
-
-# ==================== DATASET ====================
-print("\n" + "=" * 80)
-print("CREATING DATASETS")
-print("=" * 80)
-
-
+# ==================== DATASET CLASS ====================
 class CrossAttnDataset(Dataset):
-    def __init__(self, df):
-        self.df = df.reset_index(drop=True)
+    """
+    Each sample exposes:
+      chunk_ids    [MAX_CHUNKS, CHUNK_SIZE]
+      chunk_mask   [MAX_CHUNKS, CHUNK_SIZE]
+      num_chunks   scalar
+      comment_ids  [COMMENT_MAX_LENGTH]
+      comment_mask [COMMENT_MAX_LENGTH]
+      labels       scalar
+    """
+    def __init__(self, texts, bodies, labels):
+        self.texts  = texts
+        self.bodies = bodies
+        self.labels = labels
 
     def __len__(self):
-        return len(self.df)
+        return len(self.texts)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-
-        # Article chunks
         chunks, num_real = tokenize_chunks(
-            row['body'], CHUNK_SIZE, CHUNK_STRIDE, MAX_CHUNKS
+            self.bodies[idx], CHUNK_SIZE, CHUNK_STRIDE, MAX_CHUNKS
         )
-        chunk_ids  = torch.stack([c[0] for c in chunks])   # [MAX_CHUNKS, CHUNK_SIZE]
-        chunk_mask = torch.stack([c[1] for c in chunks])   # [MAX_CHUNKS, CHUNK_SIZE]
+        chunk_ids  = torch.stack([c[0] for c in chunks])
+        chunk_mask = torch.stack([c[1] for c in chunks])
 
-        # Comment
-        c_ids  = sp.encode(str(row['comment']))[:COMMENT_MAX_LENGTH]
+        c_ids  = sp.encode(str(self.texts[idx]))[:COMMENT_MAX_LENGTH]
         c_mask = [1] * len(c_ids)
         pad    = COMMENT_MAX_LENGTH - len(c_ids)
         c_ids  += [PAD_ID] * pad
@@ -323,23 +356,46 @@ class CrossAttnDataset(Dataset):
         return {
             'chunk_ids':    chunk_ids,
             'chunk_mask':   chunk_mask,
-            'num_chunks':   torch.tensor(num_real,           dtype=torch.long),
-            'comment_ids':  torch.tensor(c_ids,             dtype=torch.long),
-            'comment_mask': torch.tensor(c_mask,            dtype=torch.long),
-            'labels':       torch.tensor(int(row['label_id']), dtype=torch.long),
+            'num_chunks':   torch.tensor(num_real,              dtype=torch.long),
+            'comment_ids':  torch.tensor(c_ids,                dtype=torch.long),
+            'comment_mask': torch.tensor(c_mask,               dtype=torch.long),
+            'labels':       torch.tensor(self.labels[idx],     dtype=torch.long),
         }
 
 
-train_dataset = CrossAttnDataset(tr_df)
-val_dataset   = CrossAttnDataset(val_df)
-test_dataset  = CrossAttnDataset(test_df)
+# ==================== BALANCING HELPERS ====================
+def oversample(texts, bodies, labels, seed=42):
+    """Oversample minority classes to match majority class count."""
+    stdlib_random.seed(seed)
+    counts    = Counter(labels)
+    max_count = max(counts.values())
 
-print(f"✓ train: {len(train_dataset):,}  val: {len(val_dataset):,}  test: {len(test_dataset):,}")
-s = train_dataset[0]
-print(f"\nchunk_ids  : {s['chunk_ids'].shape}   [MAX_CHUNKS × CHUNK_SIZE]")
-print(f"num_chunks : {s['num_chunks'].item()}  real chunks for this article")
-print(f"comment_ids: {s['comment_ids'].shape}")
-print(f"label      : {s['labels'].item()} → {id_to_label[s['labels'].item()]}")
+    bal_texts, bal_bodies, bal_labels = list(texts), list(bodies), list(labels)
+    for label, count in counts.items():
+        needed = max_count - count
+        if needed == 0:
+            continue
+        indices = [i for i, l in enumerate(labels) if l == label]
+        extras  = stdlib_random.choices(indices, k=needed)
+        bal_texts  += [texts[i]  for i in extras]
+        bal_bodies += [bodies[i] for i in extras]
+        bal_labels += [labels[i] for i in extras]
+
+    combined = list(zip(bal_texts, bal_bodies, bal_labels))
+    stdlib_random.shuffle(combined)
+    bal_texts, bal_bodies, bal_labels = zip(*combined)
+    return list(bal_texts), list(bal_bodies), list(bal_labels)
+
+
+def compute_class_weights(labels, num_labels):
+    """Inverse-frequency weights normalised so they sum to num_labels."""
+    counts  = Counter(labels)
+    weights = torch.tensor(
+        [1.0 / counts.get(i, 1) for i in range(num_labels)],
+        dtype=torch.float,
+    )
+    weights = weights / weights.sum() * num_labels
+    return weights
 
 
 # ==================== CROSS-ATTENTION MODULE ====================
@@ -380,7 +436,6 @@ class MultiHeadCrossAttention(nn.Module):
         d = self.head_dim
 
         def proj_and_split(linear, x):
-            # [B, S, H] → [B, h, S, d]
             return linear(x).view(B, -1, h, d).transpose(1, 2)
 
         Q = proj_and_split(self.q_proj, query)    # [B, h, 1, d]
@@ -390,13 +445,14 @@ class MultiHeadCrossAttention(nn.Module):
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [B, h, 1, C]
 
         if key_padding_mask is not None:
-            # [B, C] → [B, 1, 1, C]
             scores = scores.masked_fill(
                 key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf')
             )
 
-        weights  = self.dropout(F.softmax(scores, dim=-1))          # [B, h, 1, C]
-        attended = torch.matmul(weights, V).squeeze(2)              # [B, h, d]
+        weights  = F.softmax(scores, dim=-1)
+        weights  = torch.nan_to_num(weights, nan=0.0)   # guard: all-masked body
+        weights  = self.dropout(weights)
+        attended = torch.matmul(weights, V).squeeze(2)               # [B, h, d]
         attended = attended.transpose(1, 2).contiguous().view(B, -1) # [B, H]
         return self.out_proj(attended)
 
@@ -407,8 +463,6 @@ class CrossAttnSentimentModel(nn.Module):
     Shared BERT + multi-head cross-attention + interaction fusion.
 
     Fusion vector = [comment_vec ; attended_ctx ; comment_vec ⊙ attended_ctx]
-    The ⊙ (element-wise product) captures whether the comment and the relevant
-    article passage carry similar or opposing signals.
     """
 
     def __init__(self, bert, hidden_size, num_labels, num_heads, attn_dropout):
@@ -416,31 +470,25 @@ class CrossAttnSentimentModel(nn.Module):
         self.bert        = bert
         self.hidden_size = hidden_size
         self.cross_attn  = MultiHeadCrossAttention(hidden_size, num_heads, attn_dropout)
-        # Fusion dim = 3 * H
         self.fusion_norm = nn.LayerNorm(hidden_size * 3)
         self.dropout     = nn.Dropout(0.1)
         self.classifier  = nn.Linear(hidden_size * 3, num_labels)
 
     def encode_chunks(self, chunk_ids, chunk_mask, num_chunks):
-        """
-        Returns:
-          cls_vecs       [B, C, H]
-          chunk_pad_mask [B, C]  True = dummy chunk
-        """
         B, C, L = chunk_ids.shape
         out      = self.bert(
             input_ids=chunk_ids.view(B * C, L),
             attention_mask=chunk_mask.view(B * C, L)
         )
-        cls_vecs = out.last_hidden_state[:, 0, :].view(B, C, -1)   # [B, C, H]
+        cls_vecs = out.last_hidden_state[:, 0, :].view(B, C, -1)
 
         idx_range      = torch.arange(C, device=chunk_ids.device).unsqueeze(0)
-        chunk_pad_mask = idx_range >= num_chunks.unsqueeze(1)       # [B, C]
+        chunk_pad_mask = idx_range >= num_chunks.unsqueeze(1)
         return cls_vecs, chunk_pad_mask
 
     def encode_comment(self, comment_ids, comment_mask):
         out = self.bert(input_ids=comment_ids, attention_mask=comment_mask)
-        return out.last_hidden_state[:, 0, :]   # [B, H]
+        return out.last_hidden_state[:, 0, :]
 
     def forward(self, chunk_ids, chunk_mask, num_chunks,
                 comment_ids, comment_mask, labels=None):
@@ -448,18 +496,15 @@ class CrossAttnSentimentModel(nn.Module):
         cls_vecs, pad_mask = self.encode_chunks(chunk_ids, chunk_mask, num_chunks)
         comment_vec        = self.encode_comment(comment_ids, comment_mask)
 
-        # comment attends to relevant article chunks
         attended_ctx = self.cross_attn(
-            query=comment_vec.unsqueeze(1),   # [B, 1, H]
-            context=cls_vecs,                 # [B, C, H]
-            key_padding_mask=pad_mask         # [B, C]
-        )                                     # → [B, H]
+            query=comment_vec.unsqueeze(1),
+            context=cls_vecs,
+            key_padding_mask=pad_mask
+        )
 
-        # Three-way fusion
         fusion = torch.cat(
             [comment_vec, attended_ctx, comment_vec * attended_ctx], dim=-1
-        )                                     # [B, 3H]
-
+        )
         logits = self.classifier(self.dropout(self.fusion_norm(fusion)))
 
         loss = None
@@ -469,70 +514,17 @@ class CrossAttnSentimentModel(nn.Module):
         return SequenceClassifierOutput(loss=loss, logits=logits)
 
 
-# ==================== LOAD BERT BACKBONE ====================
-print("\n" + "=" * 80)
-print("LOADING MODEL")
-print("=" * 80)
-
-if os.path.exists(BERT_CONFIG_FILE):
-    bert_config = BertConfig.from_json_file(BERT_CONFIG_FILE)
-    print(f"✓ Config from {BERT_CONFIG_FILE}")
-else:
-    try:
-        bert_config = BertConfig.from_pretrained(BERT_MODEL_PATH)
-        print("✓ Config from model dir")
-    except Exception:
-        bert_config = None
-        print("Config not found")
-
-print(f"\nLoading weights: {BERT_MODEL_PATH}")
-try:
-    bert_backbone = BertModel.from_pretrained(BERT_MODEL_PATH)
-    print("✓ BertModel loaded")
-except Exception as e:
-    print(f"BertModel failed ({e}), extracting from MLM checkpoint...")
-    mlm           = BertForMaskedLM.from_pretrained(BERT_MODEL_PATH)
-    bert_backbone = mlm.bert
-    if bert_config is None:
-        bert_config = mlm.config
-    print("✓ BERT encoder extracted from MLM checkpoint")
-
-hidden_size = bert_config.hidden_size if bert_config else bert_backbone.config.hidden_size
-
-assert hidden_size % CROSS_ATTN_HEADS == 0, (
-    f"CROSS_ATTN_HEADS ({CROSS_ATTN_HEADS}) must divide hidden_size ({hidden_size}). "
-    f"Valid choices: {[h for h in [1,2,4,8,12,16] if hidden_size % h == 0]}"
-)
-
-model = CrossAttnSentimentModel(
-    bert=bert_backbone,
-    hidden_size=hidden_size,
-    num_labels=NUM_LABELS,
-    num_heads=CROSS_ATTN_HEADS,
-    attn_dropout=CROSS_ATTN_DROPOUT
-)
-
-total     = sum(p.numel() for p in model.parameters())
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-extra     = sum(p.numel() for p in
-                list(model.cross_attn.parameters()) +
-                list(model.fusion_norm.parameters()) +
-                list(model.classifier.parameters()))
-
-print(f"\nModel statistics:")
-print(f"Total params      : {total:,}")
-print(f"Trainable params  : {trainable:,}  ({100*trainable/total:.1f}%)")
-print(f"Extra params      : {extra:,}  (cross-attn + fusion norm + head)")
-print(f"Cross-attn heads  : {CROSS_ATTN_HEADS}  head dim: {hidden_size // CROSS_ATTN_HEADS}")
-print(f"Fusion input dim  : {hidden_size * 3}  (comment + ctx + comment⊙ctx)")
-
-
-# ==================== COLLATOR + CUSTOM TRAINER ====================
+# ==================== COLLATOR ====================
 def collate_fn(batch):
     return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
 
 
+# ==================== CUSTOM TRAINER (supports class weights) ====================
 class CrossAttnTrainer(Trainer):
+    def __init__(self, class_weights: torch.Tensor = None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights
+
     def _make_loader(self, dataset, shuffle):
         return DataLoader(
             dataset,
@@ -553,6 +545,16 @@ class CrossAttnTrainer(Trainer):
     def get_test_dataloader(self, test_dataset):
         return self._make_loader(test_dataset, shuffle=False)
 
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels  = inputs.pop("labels")
+        outputs = model(**inputs, labels=labels)
+        if self.class_weights is not None:
+            loss_fn = nn.CrossEntropyLoss(weight=self.class_weights.to(outputs.logits.device))
+            loss    = loss_fn(outputs.logits, labels)
+        else:
+            loss = outputs.loss
+        return (loss, outputs) if return_outputs else loss
+
 
 # ==================== METRICS ====================
 def compute_metrics(eval_pred: EvalPrediction):
@@ -567,414 +569,590 @@ def compute_metrics(eval_pred: EvalPrediction):
     }
 
 
-# ==================== W&B ====================
-if USE_WANDB:
+# ==================== FRESH MODEL LOADER ====================
+def load_fresh_model():
+    """Load a fresh shared-BERT cross-attention model for each fold."""
+    if os.path.exists(BERT_CONFIG_FILE):
+        cfg = BertConfig.from_json_file(BERT_CONFIG_FILE)
+        print(f"  ✓ Config from {BERT_CONFIG_FILE}")
+    else:
+        try:
+            cfg = BertConfig.from_pretrained(BERT_MODEL_PATH)
+            print("  ✓ Config from model dir")
+        except Exception:
+            cfg = None
+            print("  ⚠️  Config not found — using defaults")
+
+    try:
+        backbone = BertModel.from_pretrained(BERT_MODEL_PATH)
+        print("  ✓ Weights loaded via BertModel")
+    except Exception as e:
+        print(f"  ⚠️  BertModel failed ({e}), trying MLM checkpoint...")
+        mlm      = BertForMaskedLM.from_pretrained(BERT_MODEL_PATH)
+        backbone = mlm.bert
+        if cfg is None:
+            cfg = mlm.config
+        print("  ✓ Weights loaded via BertForMaskedLM")
+
+    hs = cfg.hidden_size if cfg else backbone.config.hidden_size
+
+    assert hs % CROSS_ATTN_HEADS == 0, (
+        f"CROSS_ATTN_HEADS ({CROSS_ATTN_HEADS}) must divide hidden_size ({hs}). "
+        f"Valid choices: {[h for h in [1,2,4,8,12,16] if hs % h == 0]}"
+    )
+
+    m = CrossAttnSentimentModel(
+        bert=backbone,
+        hidden_size=hs,
+        num_labels=NUM_LABELS,
+        num_heads=CROSS_ATTN_HEADS,
+        attn_dropout=CROSS_ATTN_DROPOUT,
+    )
+    return m, cfg, hs
+
+
+# ==================== LOAD MODEL ONCE (to get hidden_size for W&B config) ====================
+print("\n" + "=" * 80)
+print("PROBING MODEL ARCHITECTURE")
+print("=" * 80)
+_probe_model, bert_config, hidden_size = load_fresh_model()
+extra_params = sum(p.numel() for p in
+                   list(_probe_model.cross_attn.parameters()) +
+                   list(_probe_model.fusion_norm.parameters()) +
+                   list(_probe_model.classifier.parameters()))
+total_params     = sum(p.numel() for p in _probe_model.parameters())
+trainable_params = sum(p.numel() for p in _probe_model.parameters() if p.requires_grad)
+print(f"\nTotal params      : {total_params:,}")
+print(f"Trainable params  : {trainable_params:,}  ({100*trainable_params/total_params:.1f}%)")
+print(f"Extra params      : {extra_params:,}  (cross-attn + fusion norm + classifier)")
+print(f"Cross-attn heads  : {CROSS_ATTN_HEADS}  head dim: {hidden_size // CROSS_ATTN_HEADS}")
+print(f"Fusion input dim  : {hidden_size * 3}  (comment + ctx + comment⊙ctx)")
+del _probe_model   # free memory before fold loop
+
+
+# ==================== CV STATE ====================
+skf         = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+fold_metrics = []
+all_y_true   = []
+all_y_pred   = []
+all_oof_texts = []
+best_fold_f1  = -1.0
+best_fold_idx = -1
+wandb_group_url = None
+
+
+# ==================== FOLD LOOP ====================
+for fold_idx, (train_idx, val_idx) in enumerate(
+        skf.split(all_texts, all_labels), start=1):
+
     print("\n" + "=" * 80)
-    print("INITIALIZING W&B")
+    print(f"FOLD {fold_idx} / {N_FOLDS}")
     print("=" * 80)
-    wandb_run_id = None
-    if os.path.exists(WANDB_RUN_ID_FILE):
-        with open(WANDB_RUN_ID_FILE) as f:
-            wandb_run_id = f.read().strip()
-    if wandb.run is None:
-        run = wandb.init(
-            project=WANDB_PROJECT, entity=WANDB_ENTITY,
-            name=WANDB_RUN_NAME, id=wandb_run_id, resume="allow",
-            config={
-                "stage":               STAGE_TAG,
-                "architecture":        "shared-BERT + multi-head cross-attention + interaction fusion",
-                "cross_attn_heads":    CROSS_ATTN_HEADS,
-                "cross_attn_dropout":  CROSS_ATTN_DROPOUT,
-                "fusion":              "[comment ; ctx ; comment*ctx] → LayerNorm → Linear",
-                "chunk_size":          CHUNK_SIZE,
-                "chunk_stride":        CHUNK_STRIDE,
-                "max_chunks":          MAX_CHUNKS,
-                "comment_max_length":  COMMENT_MAX_LENGTH,
-                "num_labels":          NUM_LABELS,
-                "label_names":         list(le.classes_),
-                "hidden_size":         hidden_size,
-                "extra_params":        extra,
-                "learning_rate":       LEARNING_RATE,
-                "epochs":              NUM_EPOCHS,
-                "train_batch_size":    TRAIN_BATCH_SIZE,
-                "effective_batch":     TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
-                "warmup_ratio":        WARMUP_RATIO,
-                "weight_decay":        WEIGHT_DECAY,
-                "fp16":                USE_FP16 and torch.cuda.is_available(),
-                "train_samples":       len(tr_df),
-                "val_samples":         len(val_df),
-                "test_samples":        len(test_df),
-            }
+
+    fold_output_dir = f"{OUTPUT_DIR}/fold_{fold_idx}"
+    os.makedirs(fold_output_dir, exist_ok=True)
+
+    # ── Split ───────────────────────────────────────────────────────────────
+    fold_train_texts  = [all_texts[i]  for i in train_idx]
+    fold_train_bodies = [all_bodies[i] for i in train_idx]
+    fold_train_labels = [all_labels[i] for i in train_idx]
+
+    fold_val_texts    = [all_texts[i]  for i in val_idx]
+    fold_val_bodies   = [all_bodies[i] for i in val_idx]
+    fold_val_labels   = [all_labels[i] for i in val_idx]
+
+    print(f"Train: {len(fold_train_texts)} samples  |  Val: {len(fold_val_texts)} samples")
+
+    print("Train label distribution (before oversampling):")
+    for lbl, cnt in sorted(Counter(fold_train_labels).items()):
+        print(f"  [{lbl:2d}] {id_to_label[lbl]:20s}: {cnt}")
+
+    # ── Oversample (train split only) ───────────────────────────────────────
+    if OVERSAMPLE_TRAIN:
+        fold_train_texts, fold_train_bodies, fold_train_labels = oversample(
+            fold_train_texts, fold_train_bodies, fold_train_labels,
+            seed=RANDOM_SEED + fold_idx
         )
-        with open(WANDB_RUN_ID_FILE, 'w') as f:
-            f.write(run.id)
-        print(f"✓ W&B run  : {run.get_url()}")
+        print(f"After oversampling: {len(fold_train_texts)} train samples")
+        print("Train label distribution (after oversampling):")
+        for lbl, cnt in sorted(Counter(fold_train_labels).items()):
+            print(f"  [{lbl:2d}] {id_to_label[lbl]:20s}: {cnt}")
+
+    # ── Class weights (from raw pre-oversample fold distribution) ───────────
+    raw_fold_labels = [all_labels[i] for i in train_idx]
+    fold_weights    = compute_class_weights(raw_fold_labels, NUM_LABELS)
+    if USE_CLASS_WEIGHTS:
+        print("Class weights:")
+        for i, w in enumerate(fold_weights):
+            print(f"  [{i:2d}] {id_to_label[i]:20s}: {w.item():.4f}")
+
+    # ── Datasets ─────────────────────────────────────────────────────────────
+    train_ds = CrossAttnDataset(fold_train_texts, fold_train_bodies, fold_train_labels)
+    val_ds   = CrossAttnDataset(fold_val_texts,   fold_val_bodies,   fold_val_labels)
+
+    # ── Fresh model ──────────────────────────────────────────────────────────
+    print(f"Loading fresh model for fold {fold_idx}...")
+    model, bert_config, hidden_size = load_fresh_model()
+    total_p     = sum(p.numel() for p in model.parameters())
+    trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Parameters: {total_p:,} total, {trainable_p:,} trainable")
+
+    # ── W&B (one run per fold, all in the same group) ────────────────────────
+    wandb_run_name = f"fold_{fold_idx}_of_{N_FOLDS}"
+    if USE_WANDB:
+        if wandb.run is not None:
+            wandb.finish()
+        run = wandb.init(
+            project=WANDB_PROJECT,
+            entity=WANDB_ENTITY,
+            group=WANDB_GROUP,
+            name=wandb_run_name,
+            config={
+                "task":                    "sentiment_analysis",
+                "architecture":            "shared-BERT + multi-head cross-attention + interaction fusion",
+                "stage":                   STAGE_TAG,
+                "balancing_strategy":      "oversample+class_weights",
+                "fold":                    fold_idx,
+                "n_folds":                 N_FOLDS,
+                "tokenizer":               "SentencePiece",
+                "vocab_size":              sp.get_piece_size(),
+                "hidden_size":             bert_config.hidden_size         if bert_config else "?",
+                "num_layers":              bert_config.num_hidden_layers   if bert_config else "?",
+                "num_attention_heads":     bert_config.num_attention_heads if bert_config else "?",
+                "cross_attn_heads":        CROSS_ATTN_HEADS,
+                "cross_attn_dropout":      CROSS_ATTN_DROPOUT,
+                "chunk_size":              CHUNK_SIZE,
+                "chunk_stride":            CHUNK_STRIDE,
+                "max_chunks":              MAX_CHUNKS,
+                "comment_max_length":      COMMENT_MAX_LENGTH,
+                "num_labels":              NUM_LABELS,
+                "label_names":             list(le.classes_),
+                "learning_rate":           LEARNING_RATE,
+                "epochs":                  NUM_EPOCHS,
+                "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+                "train_batch_size":        TRAIN_BATCH_SIZE,
+                "effective_batch":         TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
+                "warmup_ratio":            WARMUP_RATIO,
+                "weight_decay":            WEIGHT_DECAY,
+                "fp16":                    USE_FP16 and torch.cuda.is_available() and not USE_BF16,
+                "bf16":                    USE_BF16 and torch.cuda.is_available(),
+                "oversample":              OVERSAMPLE_TRAIN,
+                "class_weights":           USE_CLASS_WEIGHTS,
+                "train_samples_balanced":  len(fold_train_texts),
+                "val_samples":             len(fold_val_texts),
+                **{f"class_weight_{id_to_label[i]}": fold_weights[i].item()
+                   for i in range(NUM_LABELS)},
+            },
+            reinit=True,
+        )
         wandb.log({
-            "train_label_dist": wandb.Histogram(tr_df['label_id'].tolist()),
-            "val_label_dist":   wandb.Histogram(val_df['label_id'].tolist()),
+            "train_label_dist": wandb.Histogram(fold_train_labels),
+            "val_label_dist":   wandb.Histogram(fold_val_labels),
         })
+        if fold_idx == 1:
+            wandb_group_url = f"https://wandb.ai/{run.entity}/{WANDB_PROJECT}/groups/{WANDB_GROUP}"
+        print(f"  W&B run: {run.get_url()}")
+
+    # ── Training args ────────────────────────────────────────────────────────
+    training_args = TrainingArguments(
+        output_dir=fold_output_dir,
+        num_train_epochs=NUM_EPOCHS,
+        per_device_train_batch_size=TRAIN_BATCH_SIZE,
+        per_device_eval_batch_size=EVAL_BATCH_SIZE,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        learning_rate=LEARNING_RATE,
+        lr_scheduler_type="cosine",
+        weight_decay=WEIGHT_DECAY,
+        warmup_ratio=WARMUP_RATIO,
+        eval_steps=200,
+        save_steps=200,
+        eval_strategy="steps",
+        save_strategy="steps",
+        logging_steps=50,
+        logging_first_step=True,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_f1",
+        greater_is_better=True,
+        save_total_limit=2,
+        fp16=USE_FP16 and torch.cuda.is_available() and not USE_BF16,
+        bf16=USE_BF16 and torch.cuda.is_available(),
+        dataloader_num_workers=0,
+        seed=RANDOM_SEED + fold_idx,
+        report_to="none",
+        run_name=wandb_run_name if USE_WANDB else None,
+        push_to_hub=False,
+    )
+
+    # ── Trainer ──────────────────────────────────────────────────────────────
+    early_stop = EarlyStoppingCallback(early_stopping_patience=EARLY_STOPPING_PATIENCE)
+
+    trainer = CrossAttnTrainer(
+        class_weights=fold_weights if USE_CLASS_WEIGHTS else None,
+        model=model, args=training_args,
+        train_dataset=train_ds, eval_dataset=val_ds,
+        compute_metrics=compute_metrics, callbacks=[early_stop],
+    )
+
+    # ── Train ────────────────────────────────────────────────────────────────
+    print(f"\nTraining fold {fold_idx} — {NUM_LABELS} sentiment classes:")
+    for idx, name in sorted(id_to_label.items()):
+        print(f"  [{idx}] {name}")
+    print(f"\nEarly stopping patience: {EARLY_STOPPING_PATIENCE} evals")
+    if USE_WANDB:
+        print(f"Monitor at: {wandb.run.get_url()}")
+
+    try:
+        train_result = trainer.train()
+        print(f"\nFold {fold_idx} training complete.")
+        for k, v in train_result.metrics.items():
+            if isinstance(v, float):
+                print(f"  {k}: {v:.4f}")
+
+    except KeyboardInterrupt:
+        print(f"\nInterrupted at fold {fold_idx}.")
+        os.makedirs(f"{fold_output_dir}/interrupted_model", exist_ok=True)
+        torch.save(model.state_dict(),
+                   f"{fold_output_dir}/interrupted_model/pytorch_model.bin")
+
+    except Exception as e:
+        print(f"\nFold {fold_idx} failed: {e}")
+        print(traceback.format_exc())
+
+    # ── Evaluate ─────────────────────────────────────────────────────────────
+    print(f"\nEvaluating fold {fold_idx}...")
+    eval_results = trainer.evaluate()
+    print(f"Fold {fold_idx} eval metrics:")
+    for k, v in eval_results.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+
+    # ── Predictions & classification report ──────────────────────────────────
+    preds_out = trainer.predict(val_ds)
+    y_pred    = np.argmax(preds_out.predictions, axis=-1)
+    y_true    = np.array(fold_val_labels)
+
+    all_y_true.extend(y_true.tolist())
+    all_y_pred.extend(y_pred.tolist())
+    all_oof_texts.extend(fold_val_texts)
+
+    target_names = [id_to_label[i] for i in range(NUM_LABELS)]
+    print(f"\nClassification report — Fold {fold_idx}:")
+    print(classification_report(y_true, y_pred, target_names=target_names, digits=4))
+
+    # ── Save per-fold predictions ─────────────────────────────────────────────
+    fold_conf = [
+        torch.softmax(torch.tensor(preds_out.predictions[i]), dim=0)[y_pred[i]].item()
+        for i in range(len(y_pred))
+    ]
+    pd.DataFrame({
+        'comment':             fold_val_texts,
+        'true_label_id':       y_true,
+        'true_sentiment':      [id_to_label[l] for l in y_true],
+        'predicted_label_id':  y_pred,
+        'predicted_sentiment': [id_to_label[l] for l in y_pred],
+        'correct':             y_true == y_pred,
+        'confidence':          fold_conf,
+    }).to_csv(f"{fold_output_dir}/predictions.csv", index=False)
+
+    # ── Per-class metrics ─────────────────────────────────────────────────────
+    prec_pc, rec_pc, f1_pc, sup_pc = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0
+    )
+    per_class_df = pd.DataFrame({
+        'Label ID':  range(NUM_LABELS),
+        'Sentiment': target_names,
+        'Precision': prec_pc,
+        'Recall':    rec_pc,
+        'F1-Score':  f1_pc,
+        'Support':   sup_pc,
+    })
+    per_class_df.to_csv(f"{fold_output_dir}/per_class_metrics.csv", index=False)
+
+    cm = confusion_matrix(y_true, y_pred)
+    pd.DataFrame(
+        cm,
+        index=[f"True_{id_to_label[i]}"  for i in range(NUM_LABELS)],
+        columns=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)],
+    ).to_csv(f"{fold_output_dir}/confusion_matrix.csv")
+
+    # ── Store fold-level metrics ──────────────────────────────────────────────
+    fold_m = {
+        'fold':        fold_idx,
+        'accuracy':    eval_results['eval_accuracy'],
+        'precision':   eval_results['eval_precision'],
+        'recall':      eval_results['eval_recall'],
+        'f1':          eval_results['eval_f1'],
+        'f1_weighted': eval_results['eval_f1_weighted'],
+    }
+    fold_metrics.append(fold_m)
+
+    # ── W&B fold summary ─────────────────────────────────────────────────────
+    if USE_WANDB:
+        wandb.log({
+            "fold_summary/accuracy":    fold_m['accuracy'],
+            "fold_summary/f1":          fold_m['f1'],
+            "fold_summary/f1_weighted": fold_m['f1_weighted'],
+            "fold_summary/precision":   fold_m['precision'],
+            "fold_summary/recall":      fold_m['recall'],
+        })
+        wandb.log({"per_class_metrics": wandb.Table(dataframe=per_class_df)})
+        try:
+            import plotly.figure_factory as ff
+            fig = ff.create_annotated_heatmap(
+                z=cm,
+                x=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)],
+                y=[f"True_{id_to_label[i]}" for i in range(NUM_LABELS)],
+                colorscale='Blues',
+                showscale=True,
+            )
+            fig.update_layout(
+                title=f"Confusion Matrix — Fold {fold_idx}",
+                xaxis_title="Predicted Sentiment",
+                yaxis_title="True Sentiment",
+            )
+            wandb.log({"confusion_matrix": fig})
+        except ImportError:
+            pass
+
+    # ── Save best model ───────────────────────────────────────────────────────
+    if fold_m['f1'] > best_fold_f1:
+        best_fold_f1  = fold_m['f1']
+        best_fold_idx = fold_idx
+        os.makedirs(BEST_MODEL_DIR, exist_ok=True)
+        torch.save(model.state_dict(), f"{BEST_MODEL_DIR}/pytorch_model.bin")
+        if bert_config:
+            bert_config.save_pretrained(BEST_MODEL_DIR)
+        mapping_df.to_csv(f"{BEST_MODEL_DIR}/label_mapping.csv", index=False)
+        pd.DataFrame([{
+            'stage': STAGE_TAG, 'hidden_size': hidden_size,
+            'num_labels': NUM_LABELS, 'cross_attn_heads': CROSS_ATTN_HEADS,
+            'chunk_size': CHUNK_SIZE, 'chunk_stride': CHUNK_STRIDE,
+            'max_chunks': MAX_CHUNKS, 'comment_max_length': COMMENT_MAX_LENGTH,
+        }]).to_csv(f"{BEST_MODEL_DIR}/arch_config.csv", index=False)
+        print(f"\nNew best model saved (fold {fold_idx}, F1={best_fold_f1:.4f}) → {BEST_MODEL_DIR}")
+
+    print(f"\nFold {fold_idx} done — macro F1: {fold_m['f1']:.4f}")
+
+    # ── Cross-attention weight inspection (5 val samples) ────────────────────
+    print(f"\nCross-attention weight inspection (fold {fold_idx}, 5 samples):")
+    model.eval()
+    device    = next(model.parameters()).device
+    attn_rows = []
+
+    with torch.no_grad():
+        for si in range(min(5, len(val_ds))):
+            sample = val_ds[si]
+            batch  = {k: v.unsqueeze(0).to(device) for k, v in sample.items()}
+
+            n_real             = batch['num_chunks'].item()
+            cls_vecs, pad_mask = model.encode_chunks(
+                batch['chunk_ids'], batch['chunk_mask'], batch['num_chunks']
+            )
+            comment_vec = model.encode_comment(
+                batch['comment_ids'], batch['comment_mask']
+            )
+
+            ca   = model.cross_attn
+            B    = 1
+            C    = cls_vecs.shape[1]
+            h, d = ca.num_heads, ca.head_dim
+
+            Q   = ca.q_proj(comment_vec.unsqueeze(1)).view(B, 1, h, d).transpose(1, 2)
+            K   = ca.k_proj(cls_vecs).view(B, C, h, d).transpose(1, 2)
+            raw = torch.matmul(Q, K.transpose(-2, -1)) / ca.scale
+            raw = raw.masked_fill(pad_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+            w   = F.softmax(raw, dim=-1).squeeze()
+            chunk_importance = (w.mean(dim=0) if w.dim() == 2 else w)[:n_real].cpu().numpy()
+
+            comment_text = fold_val_texts[si][:80]
+            true_lbl     = id_to_label[fold_val_labels[si]]
+            pred_lbl     = id_to_label[int(all_y_pred[-(len(val_ds) - si)])]
+            correct_sym  = "✓" if fold_val_labels[si] == int(all_y_pred[-(len(val_ds) - si)]) else "✗"
+
+            print(f"Sample {si+1} [{correct_sym}]  True: {true_lbl}  Pred: {pred_lbl}")
+            print(f"Comment: {comment_text}...")
+            for ci, cw in enumerate(chunk_importance):
+                bar = "█" * int(cw * 40)
+                print(f"  chunk {ci:2d}: {cw:.4f}  {bar}")
+
+            for ci, cw in enumerate(chunk_importance):
+                attn_rows.append({
+                    'fold': fold_idx, 'sample_idx': si,
+                    'comment':        comment_text,
+                    'true_sentiment': true_lbl, 'pred_sentiment': pred_lbl,
+                    'chunk_idx': ci, 'attn_weight': float(cw),
+                })
+
+    if attn_rows:
+        attn_df = pd.DataFrame(attn_rows)
+        attn_df.to_csv(f"{fold_output_dir}/cross_attn_weights.csv", index=False)
+        if USE_WANDB:
+            wandb.log({"cross_attention_weights": wandb.Table(dataframe=attn_df)})
+        print(f"✓ Attention weights saved → {fold_output_dir}/cross_attn_weights.csv")
+
+    if USE_WANDB:
+        wandb.finish()
+        print(f"✓ W&B fold {fold_idx} run finished")
+
+    model.train()
 
 
-# ==================== TRAINING ARGS ====================
+# ==================== CROSS-VALIDATION SUMMARY ====================
 print("\n" + "=" * 80)
-print("CONFIGURING TRAINER")
+print("CROSS-VALIDATION RESULTS")
 print("=" * 80)
 
-training_args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
-    num_train_epochs=NUM_EPOCHS,
-    per_device_train_batch_size=TRAIN_BATCH_SIZE,
-    per_device_eval_batch_size=EVAL_BATCH_SIZE,
-    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-    learning_rate=LEARNING_RATE,
-    lr_scheduler_type="cosine",
-    weight_decay=WEIGHT_DECAY,
-    warmup_ratio=WARMUP_RATIO,
-    eval_strategy="epoch",
-    save_strategy="epoch",
-    logging_steps=50,
-    logging_first_step=True,
-    load_best_model_at_end=True,
-    metric_for_best_model="f1",
-    greater_is_better=True,
-    save_total_limit=3,
-    fp16=USE_FP16 and torch.cuda.is_available(),
-    dataloader_num_workers=0,   # handled inside CrossAttnTrainer
-    seed=RANDOM_SEED,
-    report_to="wandb" if USE_WANDB else "none",
-    run_name=WANDB_RUN_NAME if USE_WANDB else None,
-    push_to_hub=False,
-)
+metrics_df = pd.DataFrame(fold_metrics)
+metrics_df.to_csv(f"{OUTPUT_DIR}/cv_fold_metrics.csv", index=False)
 
-trainer = CrossAttnTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
-    compute_metrics=compute_metrics,
-)
+print("\nPer-fold results:")
+print(metrics_df.to_string(index=False))
 
-approx_steps = (len(tr_df) * NUM_EPOCHS
-                // (TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
-print(f"✓ Trainer ready  |  approx optimiser steps: ~{approx_steps:,}")
-print(f"Memory note: each step runs {MAX_CHUNKS}+1 BERT forward passes per sample in the batch")
+mean_metrics = metrics_df.drop(columns=['fold']).mean()
+std_metrics  = metrics_df.drop(columns=['fold']).std()
+
+print("\n" + "-" * 60)
+print(f"{'Metric':<20} {'Mean':>10} {'Std':>10} {'95% CI':>20}")
+print("-" * 60)
+for metric in ['accuracy', 'precision', 'recall', 'f1', 'f1_weighted']:
+    m     = mean_metrics[metric]
+    s     = std_metrics[metric]
+    ci_lo = m - 1.96 * s / (N_FOLDS ** 0.5)
+    ci_hi = m + 1.96 * s / (N_FOLDS ** 0.5)
+    print(f"  {metric:<18} {m:>10.4f} {s:>10.4f}   [{ci_lo:.4f}, {ci_hi:.4f}]")
+print("-" * 60)
+print(f"\nBest single fold: Fold {best_fold_idx}  (macro F1 = {best_fold_f1:.4f})")
+print(f"Best model saved to: {BEST_MODEL_DIR}")
 
 
-# ==================== TRAINING ====================
+# ==================== OUT-OF-FOLD (OOF) REPORT ====================
 print("\n" + "=" * 80)
-print("STARTING TRAINING")
+print("OUT-OF-FOLD (OOF) REPORT — FULL DATASET")
 print("=" * 80)
-print(f"Architecture: shared BERT + {CROSS_ATTN_HEADS}-head cross-attention")
-print(f"Fusion      : [comment ; ctx ; comment⊙ctx] → LayerNorm → Linear")
-print(f"Labels      : {', '.join(le.classes_)}")
-if USE_WANDB:
-    print(f"  W&B         : {wandb.run.get_url()}")
-print()
 
-try:
-    train_result = trainer.train()
-    print("\n✓ Training complete")
-    for k, v in train_result.metrics.items():
-        print(f"  {k}: {v:.4f}")
-
-except KeyboardInterrupt:
-    print("\nInterrupted — saving model...")
-    os.makedirs(f"{OUTPUT_DIR}/interrupted_model", exist_ok=True)
-    torch.save(model.state_dict(),
-               f"{OUTPUT_DIR}/interrupted_model/pytorch_model.bin")
-    
-except Exception as e:
-    tb_str = traceback.format_exc()
-    print(f"\nTraining failed: {e}")
-
-# ==================== SAVE MODEL ====================
-print("\n" + "=" * 80)
-print("SAVING MODEL")
-print("=" * 80)
-final_model_path = f"{OUTPUT_DIR}/final_model"
-os.makedirs(final_model_path, exist_ok=True)
-torch.save(model.state_dict(), f"{final_model_path}/pytorch_model.bin")
-if bert_config:
-    bert_config.save_pretrained(final_model_path)
-mapping_df.to_csv(f"{final_model_path}/label_mapping.csv", index=False)
-pd.DataFrame([{
-    'stage': STAGE_TAG, 'hidden_size': hidden_size,
-    'num_labels': NUM_LABELS, 'cross_attn_heads': CROSS_ATTN_HEADS,
-    'chunk_size': CHUNK_SIZE, 'chunk_stride': CHUNK_STRIDE,
-    'max_chunks': MAX_CHUNKS, 'comment_max_length': COMMENT_MAX_LENGTH,
-}]).to_csv(f"{final_model_path}/arch_config.csv", index=False)
-print(f"✓ Model saved to {final_model_path}/")
-
-
-
-# ==================== EVALUATE ====================
-print("\n" + "=" * 80)
-print("VALIDATION SET EVALUATION")
-print("=" * 80)
-val_results = trainer.evaluate()
-for k, v in val_results.items():
-    print(f"  {k:30s}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
-
-print("\n" + "=" * 80)
-print("TEST SET EVALUATION  (held-out)")
-print("=" * 80)
-test_output  = trainer.predict(test_dataset)
-y_pred       = np.argmax(test_output.predictions, axis=-1)
-y_true       = test_df['label_id'].values
-
-test_metrics = {
-    'accuracy':    accuracy_score(y_true, y_pred),
-    'precision':   precision_score(y_true, y_pred, average='macro',    zero_division=0),
-    'recall':      recall_score(y_true, y_pred,    average='macro',    zero_division=0),
-    'f1':          f1_score(y_true, y_pred,        average='macro',    zero_division=0),
-    'f1_weighted': f1_score(y_true, y_pred,        average='weighted', zero_division=0),
-}
-for k, v in test_metrics.items():
-    print(f"  {k:20s}: {v:.4f}")
-
-if USE_WANDB:
-    wandb.log({f"test/{k}": v for k, v in test_metrics.items()})
-
-
-# ==================== DETAILED REPORT ====================
-print("\n" + "=" * 80)
-print("CLASSIFICATION REPORT (test set)")
-print("=" * 80)
+oof_y_true   = np.array(all_y_true)
+oof_y_pred   = np.array(all_y_pred)
 target_names = [id_to_label[i] for i in range(NUM_LABELS)]
-report_text  = classification_report(y_true, y_pred, target_names=target_names, digits=4)
-print(report_text)
-if USE_WANDB:
-    wandb.log({"test/classification_report": wandb.Table(
-        data=[[report_text]], columns=["report"])})
+print(classification_report(oof_y_true, oof_y_pred, target_names=target_names, digits=4))
 
+oof_f1   = f1_score(oof_y_true, oof_y_pred, average='macro',    zero_division=0)
+oof_f1_w = f1_score(oof_y_true, oof_y_pred, average='weighted', zero_division=0)
+oof_acc  = accuracy_score(oof_y_true, oof_y_pred)
 
-# ==================== CONFUSION MATRIX ====================
-cm    = confusion_matrix(y_true, y_pred)
-cm_df = pd.DataFrame(
-    cm,
+print(f"OOF macro F1:    {oof_f1:.4f}")
+print(f"OOF weighted F1: {oof_f1_w:.4f}")
+print(f"OOF accuracy:    {oof_acc:.4f}")
+
+oof_cm = confusion_matrix(oof_y_true, oof_y_pred)
+pd.DataFrame(
+    oof_cm,
     index=[f"True_{id_to_label[i]}"  for i in range(NUM_LABELS)],
-    columns=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)]
-)
-cm_df.to_csv(f"{OUTPUT_DIR}/confusion_matrix_test.csv")
+    columns=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)],
+).to_csv(f"{OUTPUT_DIR}/oof_confusion_matrix.csv")
+
+pd.DataFrame({
+    'comment':             all_oof_texts,
+    'true_label_id':       oof_y_true,
+    'true_sentiment':      [id_to_label[l] for l in oof_y_true],
+    'predicted_label_id':  oof_y_pred,
+    'predicted_sentiment': [id_to_label[l] for l in oof_y_pred],
+    'correct':             oof_y_true == oof_y_pred,
+}).to_csv(f"{OUTPUT_DIR}/oof_predictions.csv", index=False)
+
+print(f"\n✓ OOF confusion matrix → {OUTPUT_DIR}/oof_confusion_matrix.csv")
+print(f"✓ OOF predictions      → {OUTPUT_DIR}/oof_predictions.csv")
+
+
+# ==================== W&B CROSS-VAL SUMMARY RUN ====================
 if USE_WANDB:
+    print("\nLogging CV summary to W&B...")
+    wandb.init(
+        project=WANDB_PROJECT,
+        entity=WANDB_ENTITY,
+        group=WANDB_GROUP,
+        name="cv_summary",
+        reinit=True,
+    )
+    for metric in ['accuracy', 'precision', 'recall', 'f1', 'f1_weighted']:
+        wandb.log({
+            f"cv_mean/{metric}": mean_metrics[metric],
+            f"cv_std/{metric}":  std_metrics[metric],
+        })
+    wandb.log({
+        "oof/f1":          oof_f1,
+        "oof/f1_weighted": oof_f1_w,
+        "oof/accuracy":    oof_acc,
+        "best_fold":       best_fold_idx,
+        "best_fold_f1":    best_fold_f1,
+        "cv_fold_metrics": wandb.Table(dataframe=metrics_df),
+    })
     try:
         import plotly.figure_factory as ff
         fig = ff.create_annotated_heatmap(
-            z=cm,
+            z=oof_cm,
             x=[f"Pred_{id_to_label[i]}" for i in range(NUM_LABELS)],
             y=[f"True_{id_to_label[i]}" for i in range(NUM_LABELS)],
-            colorscale='Blues', showscale=True
+            colorscale='Blues',
+            showscale=True,
         )
-        fig.update_layout(title=f"Confusion Matrix — {STAGE_TAG}",
-                          xaxis_title="Predicted", yaxis_title="True")
-        wandb.log({"test/confusion_matrix": fig})
+        fig.update_layout(
+            title="OOF Confusion Matrix — All Folds",
+            xaxis_title="Predicted Sentiment",
+            yaxis_title="True Sentiment",
+        )
+        wandb.log({"oof_confusion_matrix": fig})
     except ImportError:
         pass
-
-
-# ==================== PER-CLASS METRICS ====================
-prec_pc, rec_pc, f1_pc, sup_pc = precision_recall_fscore_support(
-    y_true, y_pred, average=None, zero_division=0
-)
-per_class_df = pd.DataFrame({
-    'Label ID':  range(NUM_LABELS),
-    'Sentiment': target_names,
-    'Precision': prec_pc,
-    'Recall':    rec_pc,
-    'F1-Score':  f1_pc,
-    'Support':   sup_pc
-})
-print("\n" + "=" * 80)
-print("PER-CLASS METRICS (test set)")
-print("=" * 80)
-print(per_class_df.to_string(index=False))
-per_class_df.to_csv(f"{OUTPUT_DIR}/per_class_metrics_test.csv", index=False)
-if USE_WANDB:
-    wandb.log({"test/per_class_metrics": wandb.Table(dataframe=per_class_df)})
-    for metric in ['Precision', 'Recall', 'F1-Score']:
-        data  = [[target_names[i], per_class_df.loc[i, metric]] for i in range(NUM_LABELS)]
-        tbl   = wandb.Table(data=data, columns=["Sentiment", metric])
-        wandb.log({f"test/per_class_{metric.lower().replace('-','_')}":
-                   wandb.plot.bar(tbl, "Sentiment", metric, title=f"Per-Sentiment {metric}")})
-
-
-# ==================== SAVE PREDICTIONS ====================
-confidences = [
-    torch.softmax(torch.tensor(test_output.predictions[i]), dim=0)[y_pred[i]].item()
-    for i in range(len(y_pred))
-]
-results_df = pd.DataFrame({
-    'comment':             test_df['comment'].tolist(),
-    'body_snippet':        test_df['body'].str[:120].tolist(),
-    'true_label_id':       y_true,
-    'true_sentiment':      [id_to_label[l] for l in y_true],
-    'predicted_label_id':  y_pred,
-    'predicted_sentiment': [id_to_label[l] for l in y_pred],
-    'correct':             y_true == y_pred,
-    'confidence':          confidences,
-})
-results_df.to_csv(f"{OUTPUT_DIR}/predictions_test.csv", index=False)
-print(f"\n✓ Predictions saved to {OUTPUT_DIR}/predictions_test.csv")
-
-
-# ==================== CROSS-ATTENTION WEIGHT INSPECTION ====================
-print("\n" + "=" * 80)
-print("CROSS-ATTENTION WEIGHT INSPECTION (5 test samples)")
-print("=" * 80)
-print("Shows which article chunks each comment attended to most.")
-print()
-
-model.eval()
-device    = next(model.parameters()).device
-attn_rows = []
-
-with torch.no_grad():
-    for si in range(min(5, len(test_dataset))):
-        sample = test_dataset[si]
-        batch  = {k: v.unsqueeze(0).to(device) for k, v in sample.items()}
-
-        B          = 1
-        n_real     = batch['num_chunks'].item()
-        cls_vecs, pad_mask = model.encode_chunks(
-            batch['chunk_ids'], batch['chunk_mask'], batch['num_chunks']
-        )
-        comment_vec = model.encode_comment(
-            batch['comment_ids'], batch['comment_mask']
-        )
-
-        # Recompute attention weights without dropout for inspection
-        ca = model.cross_attn
-        h, d = ca.num_heads, ca.head_dim
-        C    = cls_vecs.shape[1]
-
-        Q = ca.q_proj(comment_vec.unsqueeze(1)).view(B, 1, h, d).transpose(1, 2)
-        K = ca.k_proj(cls_vecs).view(B, C, h, d).transpose(1, 2)
-
-        raw = torch.matmul(Q, K.transpose(-2, -1)) / ca.scale   # [1, h, 1, C]
-        raw = raw.masked_fill(
-            pad_mask.unsqueeze(1).unsqueeze(2), float('-inf')
-        )
-        # Average attention across heads → per-chunk importance
-        weights = F.softmax(raw, dim=-1).squeeze()               # [h, C] or [C]
-        if weights.dim() == 2:
-            chunk_importance = weights.mean(dim=0)[:n_real].cpu().numpy()
-        else:
-            chunk_importance = weights[:n_real].cpu().numpy()
-
-        comment_text = test_df.iloc[si]['comment'][:80]
-        true_lbl     = id_to_label[y_true[si]]
-        pred_lbl     = id_to_label[y_pred[si]]
-        correct_sym  = "✓" if y_true[si] == y_pred[si] else "✗"
-
-        print(f"Sample {si+1} [{correct_sym}]")
-        print(f"Comment : {comment_text}...")
-        print(f"True    : {true_lbl}   Predicted: {pred_lbl}")
-        print(f"Chunks  : {n_real} real  |  chunk attention weights (avg across {h} heads):")
-        for ci, w in enumerate(chunk_importance):
-            bar = "█" * int(w * 40)
-            print(f"chunk {ci:2d}: {w:.4f}  {bar}")
-        print()
-
-        for ci, w in enumerate(chunk_importance):
-            attn_rows.append({
-                'sample_idx':     si,
-                'comment':        comment_text,
-                'true_sentiment': true_lbl,
-                'pred_sentiment': pred_lbl,
-                'chunk_idx':      ci,
-                'attn_weight':    float(w),
-            })
-
-if USE_WANDB and attn_rows:
-    wandb.log({"cross_attention_weights": wandb.Table(
-        dataframe=pd.DataFrame(attn_rows))})
-    print("✓ Attention weights logged to W&B")
-
-model.train()
-
-
-# ==================== STAGE COMPARISON ====================
-print("\n" + "=" * 80)
-print("STAGE COMPARISON:  COMMENTS ONLY  vs  CROSS-ATTENTION CONTEXT")
-print("=" * 80)
-
-metrics_order  = ['accuracy', 'precision', 'recall', 'f1', 'f1_weighted']
-stage1_metrics = None
-
-if STAGE1_PREDICTIONS_CSV and os.path.exists(STAGE1_PREDICTIONS_CSV):
-    try:
-        s1 = pd.read_csv(STAGE1_PREDICTIONS_CSV)
-        s1_true = s1['true_label_id'].values
-        s1_pred = s1['predicted_label_id'].values
-        stage1_metrics = {
-            'accuracy':    accuracy_score(s1_true, s1_pred),
-            'precision':   precision_score(s1_true, s1_pred, average='macro',    zero_division=0),
-            'recall':      recall_score(s1_true, s1_pred,    average='macro',    zero_division=0),
-            'f1':          f1_score(s1_true, s1_pred,        average='macro',    zero_division=0),
-            'f1_weighted': f1_score(s1_true, s1_pred,        average='weighted', zero_division=0),
-        }
-        print(f"✓ Stage 1 results loaded from {STAGE1_PREDICTIONS_CSV}\n")
-    except Exception as e:
-        print(f"Could not load Stage 1 results: {e}\n")
-else:
-    print(f"STAGE1_PREDICTIONS_CSV not found — set it to enable comparison\n")
-
-W = 22
-header = f"{'Metric':18s}  {'Stage 1 (comments)':>{W}}  {'Stage 2 (cross-attn)':>{W}}"
-if stage1_metrics:
-    header += f"{'Δ (S2 - S1)':>{W}}"
-print(header)
-print("  " + "-" * (len(header) - 2))
-
-for m in metrics_order:
-    s2 = test_metrics[m]
-    if stage1_metrics:
-        s1    = stage1_metrics[m]
-        delta = s2 - s1
-        sign  = "+" if delta >= 0 else ""
-        print(f"  {m:18s}  {s1:>{W}.4f}  {s2:>{W}.4f}  {sign}{delta:>{W-1}.4f}")
-    else:
-        print(f"  {m:18s}  {'N/A':>{W}}  {s2:>{W}.4f}")
-
-print("  " + "-" * (len(header) - 2))
-
-if stage1_metrics:
-    delta_f1 = test_metrics['f1'] - stage1_metrics['f1']
-    if delta_f1 > 0.01:
-        print(f"\nCross-attention context improves macro-F1 by +{delta_f1:.4f}")
-    elif delta_f1 < -0.01:
-        print(f"\nBaseline is better by {abs(delta_f1):.4f} — "
-              f"try more epochs or reduce MAX_CHUNKS")
-    else:
-        print(f"\nRoughly equivalent (Δ macro-F1 = {delta_f1:+.4f})")
-
-    comp_rows = [{'metric': m,
-                  'stage1_comments_only':    stage1_metrics[m],
-                  'stage2_cross_attention':  test_metrics[m],
-                  'delta': test_metrics[m] - stage1_metrics[m]}
-                 for m in metrics_order]
-    pd.DataFrame(comp_rows).to_csv(f"{OUTPUT_DIR}/stage_comparison.csv", index=False)
-    if USE_WANDB:
-        wandb.log({"stage_comparison": wandb.Table(
-            dataframe=pd.DataFrame(comp_rows))})
-    print(f"\n  ✓ Comparison saved to {OUTPUT_DIR}/stage_comparison.csv")
+    wandb.finish()
+    print(f"✓ CV summary logged — group: {WANDB_GROUP}")
 
 
 # ==================== FINAL SUMMARY ====================
-print("\n" + "=" * 80)
-print("STAGE 2 (CROSS-ATTENTION CONTEXT-AWARE) COMPLETE!")
-print("=" * 80)
-print(f"\nOutputs in: {OUTPUT_DIR}/")
-print(f"final_model/                — weights, bert config, label map, arch config")
-print(f"label_mapping.csv           — id ↔ sentiment name")
-print(f"per_class_metrics_test.csv  — per-class breakdown")
-print(f"predictions_test.csv        — test predictions + body snippet")
-print(f"confusion_matrix_test.csv   — confusion matrix")
-print(f"stage_comparison.csv        — Stage 1 vs Stage 2 delta table")
+cv_summary = {
+    'Model':                'BERT with SentencePiece',
+    'Architecture':         'Shared BERT + Multi-Head Cross-Attention + Interaction Fusion',
+    'Stage':                STAGE_TAG,
+    'Task':                 'Sentiment Analysis',
+    'Balancing':            'Oversample + Class Weights',
+    'N Folds':              N_FOLDS,
+    'Num Classes':          NUM_LABELS,
+    'Classes':              ', '.join(le.classes_),
+    'Total Samples':        len(full_df),
+    'Cross-Attn Heads':     CROSS_ATTN_HEADS,
+    'Chunk Size/Stride':    f'{CHUNK_SIZE}/{CHUNK_STRIDE}',
+    'Max Chunks':           MAX_CHUNKS,
+    'Comment Max Length':   COMMENT_MAX_LENGTH,
+    'Learning Rate':        LEARNING_RATE,
+    'Effective Batch Size': TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
+    'Best Fold':            best_fold_idx,
+    'Best Fold F1':         f'{best_fold_f1:.4f}',
+    'Mean F1 (macro)':      f'{mean_metrics["f1"]:.4f} ± {std_metrics["f1"]:.4f}',
+    'Mean F1 (weighted)':   f'{mean_metrics["f1_weighted"]:.4f} ± {std_metrics["f1_weighted"]:.4f}',
+    'Mean Accuracy':        f'{mean_metrics["accuracy"]:.4f} ± {std_metrics["accuracy"]:.4f}',
+    'OOF F1 (macro)':       f'{oof_f1:.4f}',
+    'OOF F1 (weighted)':    f'{oof_f1_w:.4f}',
+    'OOF Accuracy':         f'{oof_acc:.4f}',
+}
 
-if USE_WANDB:
-    print(f"\nFull results: {wandb.run.get_url()}")
-    _wandb_url = wandb.run.get_url()
-    wandb.finish()
-else:
-    _wandb_url = None
+pd.DataFrame([cv_summary]).to_csv(f'{OUTPUT_DIR}/cv_summary.csv', index=False)
+
+print("\n" + "=" * 80)
+print("FINAL CROSS-VALIDATION SUMMARY")
+print("=" * 80)
+for k, v in cv_summary.items():
+    print(f"  {k:<28}: {v}")
+
+print("\n" + "=" * 80)
+print("5-FOLD CROSS-VALIDATION (CONTEXT-AWARE CROSS-ATTENTION) COMPLETE!")
+print("=" * 80)
+print(f"\nOutputs saved to: {OUTPUT_DIR}/")
+print(f"fold_1/ … fold_{N_FOLDS}/      per-fold predictions, metrics, confusion matrix,")
+print(f"                               cross_attn_weights.csv")
+print(f"best_model/                    best model weights (fold {best_fold_idx}) + label_mapping.csv + arch_config.csv")
+print(f"label_mapping.csv              label id ↔ sentiment name")
+print(f"cv_fold_metrics.csv            per-fold metric table")
+print(f"cv_summary.csv                 overall CV summary")
+print(f"oof_predictions.csv            out-of-fold predictions (full dataset)")
+print(f"oof_confusion_matrix.csv       OOF confusion matrix")
+if USE_WANDB and wandb_group_url:
+    print(f"\nW&B group: {wandb_group_url}")
