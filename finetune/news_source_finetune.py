@@ -48,8 +48,6 @@ import os
 import traceback
 from collections import Counter
 import random as stdlib_random
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 import math
 
 import numpy as np
@@ -110,7 +108,7 @@ COMMENT_MAX_LENGTH           = 32     # source classification needs less context
 TRAIN_BATCH_SIZE             = 4      # lower: MAX_CHUNKS+1 BERT passes per sample
 EVAL_BATCH_SIZE              = 8
 LEARNING_RATE                = 3e-5
-NUM_EPOCHS                   = 20     # early stopping decides actual stop point
+NUM_EPOCHS                   = 2     # early stopping decides actual stop point
 WARMUP_RATIO                 = 0.06
 WEIGHT_DECAY                 = 0.01
 GRADIENT_ACCUMULATION_STEPS  = 4      # effective batch = 16
@@ -823,8 +821,10 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         lr_scheduler_type="cosine",
         weight_decay=WEIGHT_DECAY,
         warmup_ratio=WARMUP_RATIO,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        eval_steps=150,
+        save_steps=150,
+        eval_strategy="steps",
+        save_strategy="steps",
         logging_steps=50,
         logging_first_step=True,
         load_best_model_at_end=True,
@@ -956,9 +956,6 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
             wandb.log({"confusion_matrix": fig})
         except ImportError:
             pass
-        wandb.finish()
-        print(f"✓ W&B fold {fold_idx} run finished")
-
     # ==================== Save best model ====================
     if fold_m['f1'] > best_fold_f1:
         best_fold_f1  = fold_m['f1']
@@ -1036,6 +1033,10 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         if USE_WANDB:
             wandb.log({"cross_attention_weights": wandb.Table(dataframe=attn_df)})
         print(f"✓ Attention weights saved → {fold_output_dir}/cross_attn_weights.csv")
+
+    if USE_WANDB:
+        wandb.finish()
+        print(f"✓ W&B fold {fold_idx} run finished")
 
     model.train()
 
