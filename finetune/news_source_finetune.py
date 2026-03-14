@@ -100,7 +100,7 @@ MAX_CHUNKS   = 16     # cap per article — reduce to 8 if OOM
 
 # ==================== Cross-attention ====================
 CROSS_ATTN_HEADS   = 8     # must divide hidden_size (768/8 = 96 per head)
-CROSS_ATTN_DROPOUT = 0.1
+CROSS_ATTN_DROPOUT = 0.2
 
 # Training Parameters
 NUM_LABELS                   = 9      # auto-detected from data below
