@@ -4,6 +4,7 @@ Sinhala-text-classification/
 SinBERT-large/
 SinBERT-small/
 data/
+finetuned_models/
 
 models/
 
