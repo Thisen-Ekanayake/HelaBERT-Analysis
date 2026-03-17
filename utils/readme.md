@@ -1,0 +1,1 @@
+these are old scripts used for experiments. final finetune and testing scripts in `finetune` and `test` directories in root.
