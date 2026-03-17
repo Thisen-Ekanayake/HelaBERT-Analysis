@@ -6,11 +6,15 @@ This repository provides a comprehensive suite of tools for finetuning and evalu
 
 The repository is organized into several functional modules:
 
-*   **`finetune/`**: Contains the core training scripts for various downstream tasks.
-    *   `news_category_finetune.py`: Multi-class classification of Sinhala news articles (5 categories).
-    *   `news_source_finetune.py`: Identification of news sources/publishers (9 classes).
-    *   `sentiment_context_aware_finetune.py`: Sentiment analysis using custom cross-attention architecture to ground comments in article context.
-    *   `writing_style_finetune.py`: Classification of writing styles in Sinhala text.
+*   **`finetune/`**: Core training scripts for downstream tasks.
+    *   `news_category.py`: Fine-tunes BERT for 5-category news classification using 5-fold CV, oversampling, and weighted loss.
+    *   `news_source.py`: Fine-tunes BERT for identifying 9 news sources with balanced training strategies.
+    *   `sentiment.py`: Fine-tunes BERT for basic sentiment analysis (Positive, Negative, Neutral).
+    *   `sentiment_bidirectional.py`: Advanced sentiment analysis using bidirectional cross-attention to ground comments in article context.
+    *   `writing_style.py`: Fine-tunes BERT for classification of writing styles (Academic, News, Blog, Creative).
+*   **`test/`**: Evaluation scripts for the fine-tuned models.
+    *   `news_category.py`, `news_source.py`, `sentiment.py`, `sentiment_bidirectional.py`, `writing_style.py`: Each script loads its respective best model and evaluates it against held-out test data, generating detailed metrics and confusion matrices.
+*   **`utils/`**: Contains experimental scripts and older versions of fine-tuning/testing implementations used for initial research.
 *   **`docs/`**: Technical documentation regarding the finetuning strategies, hyperparameters, and model architectures.
 
 ## Datasets
@@ -64,12 +68,18 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Finetuning and Evaluation
+### Finetuning
 To start a finetuning run, execute the desired script from the `finetune/` directory. For example, to train the news category classifier:
 ```bash
-python finetune/news_category_finetune.py
+python finetune/news_category.py
 ```
-Once the model is trained, it is automatically tested using the corresponding test datasets in the `test/` directory to evaluate performance and display final results (Accuracy, F1-score, Confusion Matrix, etc.).
+
+### Evaluation
+Once the model is trained, you can evaluate it using scripts `test/` and display final results (Accuracy, F1-score, Confusion Matrix, etc.).
+>Note: Adjust model and dataset paths accordingly.
+```bash
+python test/news_category.py
+```
 
 ## Citation
 If you use HelaBERT or this analysis framework in your research, please use the following citation:
