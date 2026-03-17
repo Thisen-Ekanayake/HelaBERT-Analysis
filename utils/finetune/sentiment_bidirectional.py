@@ -37,13 +37,14 @@ Architecture:
   • Symmetric interaction tensor between both modalities
 
 Cross-validation strategy:
-  • StratifiedKFold(n_splits=5) over the combined train+test pool
+  • StratifiedKFold(n_splits=5) over training data
   • Oversampling applied ONLY to each fold's training split (never the val split)
   • Class weights recomputed per fold from that fold's raw training distribution
   • Fresh model loaded at the start of every fold
   • Best model across all folds (highest val macro-F1) is saved as the final model
   • Mean ± std reported across all folds at the end
   • Bidirectional cross-attention weights inspected on 5 val samples per fold
+  • Out-of-fold (OOF) report generated from predictions on all training data
 
 Expected CSV columns (via BODY_COL / COMMENT_COL / LABEL_COL config):
     body, comment_phrase, comment_sentiment
@@ -88,8 +89,7 @@ BERT_MODEL_PATH  = "HelaBERT"
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT/config.json"
 
-TRAIN_DATA_PATH  = "data/sinhala-sentiment-analysis/outputs/train.csv"
-TEST_DATA_PATH   = "data/sinhala-sentiment-analysis/outputs/test.csv"
+DATA_PATH        = "data/sinhala-sentiment-analysis/outputs/train.csv"
 
 # ==================== TSV column names ====================
 BODY_COL    = "body"
@@ -146,8 +146,7 @@ print(f"\n✓ Config loaded — {N_FOLDS}-fold CV, oversampling={'on' if OVERSAM
       f"class_weights={'on' if USE_CLASS_WEIGHTS else 'off'}")
 print(f"  Model path:        {BERT_MODEL_PATH}")
 print(f"  Tokenizer:         {TOKENIZER_MODEL}")
-print(f"  Train data:        {TRAIN_DATA_PATH}")
-print(f"  Test data:         {TEST_DATA_PATH}")
+print(f"  Data:              {DATA_PATH}")
 print(f"  Output directory:  {OUTPUT_DIR}")
 print(f"  W&B logging:       {'Enabled' if USE_WANDB else 'Disabled'}")
 print(f"  Architecture:      shared BERT + bidirectional {CROSS_ATTN_HEADS}-head cross-attention + interaction fusion")
@@ -185,8 +184,7 @@ print("VERIFYING PATHS")
 print("=" * 80)
 assert os.path.exists(BERT_MODEL_PATH), f"{BERT_MODEL_PATH}"
 assert os.path.exists(TOKENIZER_MODEL), f"{TOKENIZER_MODEL}"
-assert os.path.exists(TRAIN_DATA_PATH), f"{TRAIN_DATA_PATH}"
-assert os.path.exists(TEST_DATA_PATH),  f"{TEST_DATA_PATH}"
+assert os.path.exists(DATA_PATH),       f"{DATA_PATH}"
 print("✓ All paths verified")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -266,20 +264,18 @@ def tokenize_chunks(text, chunk_size, stride, max_chunks):
 print("\n" + "=" * 80)
 print("LOADING DATA")
 print("=" * 80)
-train_df = load_tsv(TRAIN_DATA_PATH)
-test_df  = load_tsv(TEST_DATA_PATH)
-print(f"✓ Train: {len(train_df):,}  Test: {len(test_df):,}")
+df = load_tsv(DATA_PATH)
+print(f"✓ Loaded: {len(df):,} samples")
 
 
 # ==================== ENCODE LABELS ====================
 print("\n" + "=" * 80)
 print("ENCODING LABELS")
 print("=" * 80)
-all_labels_raw = pd.concat([train_df['label'], test_df['label']]).unique()
+all_labels_raw = df['label'].unique()
 le = LabelEncoder()
 le.fit(sorted(all_labels_raw))
-train_df['label_id'] = le.transform(train_df['label'])
-test_df['label_id']  = le.transform(test_df['label'])
+df['label_id'] = le.transform(df['label'])
 NUM_LABELS  = len(le.classes_)
 id_to_label = {i: lbl for i, lbl in enumerate(le.classes_)}
 
@@ -288,20 +284,17 @@ mapping_df = pd.DataFrame({'label_id': list(id_to_label.keys()),
 mapping_df.to_csv(f"{OUTPUT_DIR}/label_mapping.csv", index=False)
 print(f"✓ {NUM_LABELS} labels: {', '.join(le.classes_)}")
 for idx, lbl in sorted(id_to_label.items()):
-    tr = (train_df['label_id'] == idx).sum()
-    te = (test_df['label_id']  == idx).sum()
-    print(f"  [{idx}] {lbl:20s}  train: {tr:5d}  test: {te:5d}")
+    cnt = (df['label_id'] == idx).sum()
+    print(f"  [{idx}] {lbl:20s}: {cnt:5d}")
 
 
 # ==================== BUILD CV POOL ====================
-# Combine train + test so CV folds are drawn from the full labelled dataset.
-# The held-out test fold acts as the validation set for that fold.
 print("\n" + "=" * 80)
-print("BUILDING CV POOL  (train + test combined)")
+print("BUILDING CV POOL (training data only)")
 print("=" * 80)
-full_df = pd.concat([train_df, test_df], ignore_index=True)
-print(f"✓ Total pool: {len(full_df):,} samples")
-print("Full dataset label distribution:")
+full_df = df.copy()
+print(f"✓ CV pool: {len(full_df):,} samples")
+print("Dataset label distribution:")
 for idx, cnt in sorted(Counter(full_df['label_id'].tolist()).items()):
     print(f"  [{idx}] {id_to_label[idx]:20s}: {cnt:6d} ({100*cnt/len(full_df):.1f}%)")
 
