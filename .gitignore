@@ -25,6 +25,7 @@ HelaBERT_sentiment_crossattn/
 model_card.md
 *.txt
 *.png
+*.pdf
 
 .env
 
