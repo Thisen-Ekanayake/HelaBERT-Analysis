@@ -1,10 +1,10 @@
 """
-Fine-tuning SinBERT_large for Writing Style Classification — 5-Fold Cross Validation
+Fine-tuning XLM-R_large for Writing Style Classification — 5-Fold Cross Validation
 — Balanced training via oversampling + weighted loss —
 — Comparison baseline against HelaBERT —
 
 Architecture:
-    text → SinBERT_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
+    text → XLM-R_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
     (full fine-tuning)
 
 Mirrors the exact training/evaluation pipeline used for HelaBERT:
@@ -16,7 +16,7 @@ Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • OOF report generated at end
   • W&B logging enabled
 
-Model:   SinBERT/SinBERT-large
+Model:   FacebookAI/xlm-roberta-large
 Task:    Writing Style Classification
 Data:    data/Writing-style-classification/train/writing_style_train.csv
 """
@@ -52,10 +52,10 @@ import wandb
 
 # ==================== CONFIGURATION ====================
 print("=" * 80)
-print("SINBERT_LARGE FINE-TUNING — 5-FOLD CV  [WRITING STYLE CLASSIFICATION]")
+print("XLM-R_LARGE FINE-TUNING — 5-FOLD CV  [WRITING STYLE CLASSIFICATION]")
 print("=" * 80)
 
-MODEL_NAME       = "SinBERT/SinBERT-large"
+MODEL_NAME       = "FacebookAI/xlm-roberta-large"
 DATA_PATH        = "data/Writing-style-classification/train/writing_style_train.csv"
 
 NUM_LABELS                   = None  # resolved from data
@@ -73,7 +73,7 @@ N_FOLDS           = 5
 OVERSAMPLE_TRAIN  = True
 USE_CLASS_WEIGHTS = True
 
-OUTPUT_DIR     = "SinBERT_large_finetuned_writing_style_cv"
+OUTPUT_DIR     = "XLM_R_large_finetuned_writing_style_cv"
 BEST_MODEL_DIR = f"{OUTPUT_DIR}/best_model"
 
 RANDOM_SEED = 42
@@ -81,7 +81,7 @@ USE_FP16    = True
 NUM_WORKERS = 2
 
 USE_WANDB      = True
-WANDB_PROJECT  = "SinBERT_large-writing-style-finetuning"
+WANDB_PROJECT  = "XLM_R_large-writing-style-finetuning"
 WANDB_GROUP    = f"5fold_cv_lr{LEARNING_RATE}_bs{TRAIN_BATCH_SIZE}"
 WANDB_ENTITY   = None
 
@@ -213,7 +213,7 @@ def print_metric(key, value):
 # ==================== MODEL ====================
 class ClassificationModel(nn.Module):
     """
-    SinBERT_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
+    XLM-R_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
 
     Mirrors HelaBERT's BaselineModel architecture exactly.
     Full fine-tuning end-to-end.
@@ -685,7 +685,7 @@ if USE_WANDB:
 
 # ==================== FINAL SUMMARY ====================
 cv_summary = {
-    'Model':                "SinBERT_large",
+    'Model':                "XLM-R_large",
     'HuggingFace ID':       MODEL_NAME,
     'Frozen Encoder':       "No",
     'Task':                 "Writing Style Classification",
@@ -707,15 +707,26 @@ cv_summary = {
 
 pd.DataFrame([cv_summary]).to_csv(f'{OUTPUT_DIR}/cv_summary.csv', index=False)
 
-print("\n" + "=" * 80)
-print("FINAL CROSS-VALIDATION SUMMARY")
-print("=" * 80)
+final_summary_lines = []
+final_summary_lines.append("\n" + "=" * 80)
+final_summary_lines.append("FINAL CROSS-VALIDATION SUMMARY")
+final_summary_lines.append("=" * 80)
 for k, v in cv_summary.items():
-    print(f"  {k:<28}: {v}")
-
-print("\n" + "=" * 80)
-print(f"5-FOLD CV COMPLETE — SinBERT_large / Writing Style Classification")
-print("=" * 80)
-print(f"\nOutputs saved to: {OUTPUT_DIR}/")
+    final_summary_lines.append(f"  {k:<28}: {v}")
+final_summary_lines.append("\n" + "=" * 80)
+final_summary_lines.append(f"5-FOLD CV COMPLETE — XLM-R_large / Writing Style Classification")
+final_summary_lines.append("=" * 80)
+final_summary_lines.append(f"\nOutputs saved to: {OUTPUT_DIR}/")
 if USE_WANDB and wandb_group_url:
-    print(f"W&B group: {wandb_group_url}")
+    final_summary_lines.append(f"W&B group: {wandb_group_url}")
+
+final_summary_text = "\n".join(final_summary_lines)
+print(final_summary_text)
+
+# ==================== SAVE EVAL RESULTS ====================
+_eval_results_dir = os.path.join("eval_results", "XLM-R_large")
+os.makedirs(_eval_results_dir, exist_ok=True)
+_eval_results_path = os.path.join(_eval_results_dir, "writing_style.txt")
+with open(_eval_results_path, "w", encoding="utf-8") as _f:
+    _f.write(final_summary_text + "\n")
+print(f"\nEval results saved to: {_eval_results_path}")

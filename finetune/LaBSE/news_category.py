@@ -1,11 +1,11 @@
 """
-Fine-tuning LaBSE for News Category Classification — 5-Fold Cross Validation
+Fine-tuning XLM-R_large for News Category Classification — 5-Fold Cross Validation
 — Balanced training via oversampling + weighted loss —
 — Comparison baseline against HelaBERT —
 
 Architecture:
-    text → LaBSE encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
-    (encoder FROZEN — classification head only)
+    text → XLM-R_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
+    (full fine-tuning)
 
 Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • StratifiedKFold(n_splits=5) — same splits strategy
@@ -16,7 +16,7 @@ Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • OOF report generated at end
   • W&B logging enabled
 
-Model:   sentence-transformers/LaBSE
+Model:   FacebookAI/xlm-roberta-large
 Task:    News Category Classification
 Data:    data/Sinhala-News-Category-classification/train/news_train.csv
 """
@@ -52,10 +52,10 @@ import wandb
 
 # ==================== CONFIGURATION ====================
 print("=" * 80)
-print("LABSE FINE-TUNING — 5-FOLD CV  [NEWS CATEGORY CLASSIFICATION]")
+print("XLM-R_LARGE FINE-TUNING — 5-FOLD CV  [NEWS CATEGORY CLASSIFICATION]")
 print("=" * 80)
 
-MODEL_NAME       = "sentence-transformers/LaBSE"
+MODEL_NAME       = "FacebookAI/xlm-roberta-large"
 DATA_PATH        = "data/Sinhala-News-Category-classification/train/news_train.csv"
 
 NUM_LABELS                   = 5
@@ -73,7 +73,7 @@ N_FOLDS           = 5
 OVERSAMPLE_TRAIN  = True
 USE_CLASS_WEIGHTS = True
 
-OUTPUT_DIR     = "LaBSE_finetuned_news_category_cv"
+OUTPUT_DIR     = "XLM_R_large_finetuned_news_category_cv"
 BEST_MODEL_DIR = f"{OUTPUT_DIR}/best_model"
 
 RANDOM_SEED = 42
@@ -81,13 +81,13 @@ USE_FP16    = True
 NUM_WORKERS = 2
 
 USE_WANDB      = True
-WANDB_PROJECT  = "LaBSE-news-category-finetuning"
+WANDB_PROJECT  = "XLM_R_large-news-category-finetuning"
 WANDB_GROUP    = f"5fold_cv_lr{LEARNING_RATE}_bs{TRAIN_BATCH_SIZE}"
 WANDB_ENTITY   = None
 
 print(f"\n✓ Model:           {MODEL_NAME}")
 print(f"  Task:            News Category Classification")
-print(f"  Frozen encoder:  Yes")
+print(f"  Frozen encoder:  No")
 print(f"  Max length:      {COMMENT_MAX_LENGTH}")
 print(f"  Effective batch: {TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
 
@@ -213,10 +213,10 @@ def print_metric(key, value):
 # ==================== MODEL ====================
 class ClassificationModel(nn.Module):
     """
-    LaBSE encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
+    XLM-R_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
 
     Mirrors HelaBERT's BaselineModel architecture exactly.
-    Encoder is FROZEN (LaBSE used as fixed feature extractor).
+    Full fine-tuning end-to-end.
     """
 
     def __init__(self, encoder, hidden_size, num_labels, dropout=0.1):
@@ -263,11 +263,6 @@ class WeightedTrainer(Trainer):
 def load_fresh_model(num_labels):
     """Load a fresh model for each fold (same pattern as HelaBERT's load_fresh_model)."""
     encoder = AutoModel.from_pretrained(MODEL_NAME)
-
-    # Freeze encoder — LaBSE used as fixed feature extractor
-    for param in encoder.parameters():
-        param.requires_grad = False
-    print("  ✓ Encoder frozen — only classifier head will be trained")
     hidden_size = encoder.config.hidden_size
     model = ClassificationModel(
         encoder=encoder,
@@ -286,6 +281,7 @@ try:
     df = pd.read_csv(DATA_PATH)
 except pd.errors.ParserError:
     df = pd.read_csv(DATA_PATH, engine='python', on_bad_lines='skip')
+
     df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
 
     possible_comment_cols = [c for c in df.columns if 'comments' in c.lower()]
@@ -409,7 +405,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
                 "model":                  MODEL_NAME,
                 "fold":                   fold_idx,
                 "n_folds":                N_FOLDS,
-                "frozen_encoder":         True,
+                "frozen_encoder":         False,
                 "comment_max_length":     COMMENT_MAX_LENGTH,
                 "learning_rate":          LEARNING_RATE,
                 "epochs":                 NUM_EPOCHS,
@@ -578,7 +574,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
                 "hidden_size":        hidden_size,
                 "num_labels":         NUM_LABELS,
                 "comment_max_length": COMMENT_MAX_LENGTH,
-                "frozen_encoder":     True,
+                "frozen_encoder":     False,
             }, fh, indent=2)
         print(f"\nNew best model saved (fold {fold_idx}, F1={best_fold_f1:.4f}) → {BEST_MODEL_DIR}")
 
@@ -681,9 +677,9 @@ if USE_WANDB:
 
 # ==================== FINAL SUMMARY ====================
 cv_summary = {
-    'Model':                "LaBSE",
+    'Model':                "XLM-R_large",
     'HuggingFace ID':       MODEL_NAME,
-    'Frozen Encoder':       "Yes",
+    'Frozen Encoder':       "No",
     'Task':                 "News Category Classification",
     'N Folds':              N_FOLDS,
     'Num Classes':          NUM_LABELS,
@@ -703,15 +699,26 @@ cv_summary = {
 
 pd.DataFrame([cv_summary]).to_csv(f'{OUTPUT_DIR}/cv_summary.csv', index=False)
 
-print("\n" + "=" * 80)
-print("FINAL CROSS-VALIDATION SUMMARY")
-print("=" * 80)
+final_summary_lines = []
+final_summary_lines.append("\n" + "=" * 80)
+final_summary_lines.append("FINAL CROSS-VALIDATION SUMMARY")
+final_summary_lines.append("=" * 80)
 for k, v in cv_summary.items():
-    print(f"  {k:<28}: {v}")
-
-print("\n" + "=" * 80)
-print(f"5-FOLD CV COMPLETE — LaBSE / News Category Classification")
-print("=" * 80)
-print(f"\nOutputs saved to: {OUTPUT_DIR}/")
+    final_summary_lines.append(f"  {k:<28}: {v}")
+final_summary_lines.append("\n" + "=" * 80)
+final_summary_lines.append(f"5-FOLD CV COMPLETE — XLM-R_large / News Category Classification")
+final_summary_lines.append("=" * 80)
+final_summary_lines.append(f"\nOutputs saved to: {OUTPUT_DIR}/")
 if USE_WANDB and wandb_group_url:
-    print(f"W&B group: {wandb_group_url}")
+    final_summary_lines.append(f"W&B group: {wandb_group_url}")
+
+final_summary_text = "\n".join(final_summary_lines)
+print(final_summary_text)
+
+# ==================== SAVE EVAL RESULTS ====================
+_eval_results_dir = os.path.join("eval_results", "XLM-R_large")
+os.makedirs(_eval_results_dir, exist_ok=True)
+_eval_results_path = os.path.join(_eval_results_dir, "news_category.txt")
+with open(_eval_results_path, "w", encoding="utf-8") as _f:
+    _f.write(final_summary_text + "\n")
+print(f"\nEval results saved to: {_eval_results_path}")

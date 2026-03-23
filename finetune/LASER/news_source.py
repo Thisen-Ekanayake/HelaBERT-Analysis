@@ -1,13 +1,11 @@
 """
-Fine-tuning LASER for News Source Classification — 5-Fold Cross Validation
+Fine-tuning XLM-R_large for News Source Classification — 5-Fold Cross Validation
 — Balanced training via oversampling + weighted loss —
 — Comparison baseline against HelaBERT —
 
 Architecture:
-    text → LASER encoder (frozen) → sentence embedding → LayerNorm → Dropout → Linear → num_labels
-
-LASER is used as a frozen sentence-embedding encoder. Only the classification
-head (LayerNorm → Dropout → Linear) is trained — identical to the LaBSE approach.
+    text → XLM-R_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
+    (full fine-tuning)
 
 Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • StratifiedKFold(n_splits=5) — same splits strategy
@@ -18,9 +16,7 @@ Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • OOF report generated at end
   • W&B logging enabled
 
-Requires: pip install laserembeddings
-          python -m laserembeddings download-models
-
+Model:   FacebookAI/xlm-roberta-large
 Task:    News Source Classification
 Data:    data/Sinhala-News-Source-classification/train/news_source_train.csv
 """
@@ -44,6 +40,8 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 from transformers import (
+    AutoTokenizer,
+    AutoModel,
     Trainer,
     TrainingArguments,
     EvalPrediction,
@@ -52,58 +50,45 @@ from transformers import (
 import random
 import wandb
 
-# LASER import — requires laserembeddings package
-try:
-    from laserembeddings import Laser
-    _laser_available = True
-except ImportError:
-    raise ImportError(
-        "laserembeddings is not installed.\n"
-        "Install with: pip install laserembeddings\n"
-        "Then download models: python -m laserembeddings download-models"
-    )
-
 # ==================== CONFIGURATION ====================
 print("=" * 80)
-print("LASER FINE-TUNING — 5-FOLD CV  [NEWS SOURCE CLASSIFICATION]")
+print("XLM-R_LARGE FINE-TUNING — 5-FOLD CV  [NEWS SOURCE CLASSIFICATION]")
 print("=" * 80)
 
+MODEL_NAME       = "FacebookAI/xlm-roberta-large"
 DATA_PATH        = "data/Sinhala-News-Source-classification/train/news_source_train.csv"
-LASER_LANG       = "si"    # Sinhala ISO 639-1 code
 
 NUM_LABELS                   = 9
-# LASER produces 1024-dim embeddings
-LASER_EMBED_DIM              = 1024
-TRAIN_BATCH_SIZE             = 16   # larger batch OK since no backprop through encoder
-EVAL_BATCH_SIZE              = 32
+COMMENT_MAX_LENGTH           = 512
+TRAIN_BATCH_SIZE             = 4
+EVAL_BATCH_SIZE              = 8
 LEARNING_RATE                = 2e-05
 NUM_EPOCHS                   = 12
 WARMUP_RATIO                 = 0.05
 WEIGHT_DECAY                 = 0.05
-GRADIENT_ACCUMULATION_STEPS  = 1    # no encoder — lighter compute
+GRADIENT_ACCUMULATION_STEPS  = 4    # effective batch = 16
 EARLY_STOPPING_PATIENCE      = 3
 
 N_FOLDS           = 5
 OVERSAMPLE_TRAIN  = True
 USE_CLASS_WEIGHTS = True
 
-OUTPUT_DIR     = "LASER_finetuned_news_source_cv"
+OUTPUT_DIR     = "XLM_R_large_finetuned_news_source_cv"
 BEST_MODEL_DIR = f"{OUTPUT_DIR}/best_model"
 
 RANDOM_SEED = 42
-USE_FP16    = False   # LASER embeddings are float32; FP16 not needed
+USE_FP16    = True
 NUM_WORKERS = 2
 
 USE_WANDB      = True
-WANDB_PROJECT  = "LASER-news-source-finetuning"
+WANDB_PROJECT  = "XLM_R_large-news-source-finetuning"
 WANDB_GROUP    = f"5fold_cv_lr{LEARNING_RATE}_bs{TRAIN_BATCH_SIZE}"
 WANDB_ENTITY   = None
 
-print(f"\n✓ Model:           LASER (laserembeddings)")
-print(f"  Language:        {LASER_LANG}")
+print(f"\n✓ Model:           {MODEL_NAME}")
 print(f"  Task:            News Source Classification")
-print(f"  Embedding dim:   {LASER_EMBED_DIM}")
-print(f"  Frozen encoder:  Yes")
+print(f"  Frozen encoder:  No")
+print(f"  Max length:      {COMMENT_MAX_LENGTH}")
 print(f"  Effective batch: {TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
 
 
@@ -125,47 +110,47 @@ print(f"PyTorch: {torch.__version__}  |  CUDA: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 else:
-    print("CPU only")
+    print("CPU only — training will be slow")
 assert os.path.exists(DATA_PATH), f"Data not found: {DATA_PATH}"
 print("All paths verified")
 
 
-# ==================== LOAD LASER ====================
+# ==================== TOKENIZER ====================
 print("\n" + "=" * 80)
-print("LOADING LASER ENCODER")
+print("LOADING TOKENIZER")
 print("=" * 80)
-laser = Laser()
-print("✓ LASER loaded")
-
-
-def encode_texts(texts, batch_size=256):
-    """Encode a list of texts to LASER embeddings [N, 1024]."""
-    embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        emb   = laser.embed_sentences(batch, lang=LASER_LANG)
-        embeddings.append(emb)
-    return np.vstack(embeddings).astype(np.float32)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+print(f"✓ Tokenizer loaded — vocab size: {tokenizer.vocab_size}")
 
 
 # ==================== DATASET ====================
-class LaserEmbeddingDataset(Dataset):
+class TextClassificationDataset(Dataset):
     """
-    Pre-computed LASER embeddings — avoids re-encoding each sample every epoch.
-    Mirrors HelaBERT's Dataset interface for Trainer compatibility.
+    Tokenises each text sample with AutoTokenizer.
+    Mirrors HelaBERT's COMMENT_MAX_LENGTH truncation/padding approach.
     """
 
-    def __init__(self, embeddings: np.ndarray, labels: list):
-        self.embeddings = torch.tensor(embeddings, dtype=torch.float32)
-        self.labels     = labels
+    def __init__(self, texts, labels, tokenizer, max_length):
+        self.texts     = texts
+        self.labels    = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.texts)
 
     def __getitem__(self, idx):
+        enc = self.tokenizer(
+            str(self.texts[idx]),
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
         return {
-            'input_embeds': self.embeddings[idx],   # [1024]
-            'labels':       torch.tensor(self.labels[idx], dtype=torch.long),
+            'input_ids':      enc['input_ids'].squeeze(0),
+            'attention_mask': enc['attention_mask'].squeeze(0),
+            'labels':         torch.tensor(self.labels[idx], dtype=torch.long),
         }
 
 
@@ -206,7 +191,7 @@ def compute_class_weights(labels, num_labels):
 
 
 def compute_metrics(eval_pred: EvalPrediction) -> dict:
-    """Identical metric set to HelaBERT."""
+    """Identical metric set to HelaBERT: accuracy, macro-F1, weighted-F1, precision, recall."""
     preds  = np.argmax(eval_pred.predictions, axis=1)
     labels = eval_pred.label_ids
     return {
@@ -226,23 +211,26 @@ def print_metric(key, value):
 
 
 # ==================== MODEL ====================
-class LaserClassificationModel(nn.Module):
+class ClassificationModel(nn.Module):
     """
-    LASER frozen encoder → pre-computed embedding → LayerNorm → Dropout → Linear
+    XLM-R_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
 
-    Mirrors HelaBERT's classifier head exactly.
-    Input is a pre-computed embedding vector [B, 1024] rather than token IDs.
+    Mirrors HelaBERT's BaselineModel architecture exactly.
+    Full fine-tuning end-to-end.
     """
 
-    def __init__(self, embed_dim, num_labels, dropout=0.1):
+    def __init__(self, encoder, hidden_size, num_labels, dropout=0.1):
         super().__init__()
-        self.embed_dim  = embed_dim
-        self.norm       = nn.LayerNorm(embed_dim)
-        self.dropout    = nn.Dropout(dropout)
-        self.classifier = nn.Linear(embed_dim, num_labels)
+        self.encoder    = encoder
+        self.hidden_size = hidden_size
+        self.norm        = nn.LayerNorm(hidden_size)
+        self.dropout     = nn.Dropout(dropout)
+        self.classifier  = nn.Linear(hidden_size, num_labels)
 
-    def forward(self, input_embeds, labels=None, **kwargs):
-        logits = self.classifier(self.dropout(self.norm(input_embeds)))
+    def forward(self, input_ids, attention_mask, labels=None, **kwargs):
+        out     = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        cls_vec = out.last_hidden_state[:, 0, :]   # [B, H]
+        logits  = self.classifier(self.dropout(self.norm(cls_vec)))
 
         loss = None
         if labels is not None:
@@ -273,9 +261,15 @@ class WeightedTrainer(Trainer):
 
 
 def load_fresh_model(num_labels):
-    """Load a fresh classifier head for each fold."""
-    model = LaserClassificationModel(embed_dim=LASER_EMBED_DIM, num_labels=num_labels)
-    return model
+    """Load a fresh model for each fold (same pattern as HelaBERT's load_fresh_model)."""
+    encoder = AutoModel.from_pretrained(MODEL_NAME)
+    hidden_size = encoder.config.hidden_size
+    model = ClassificationModel(
+        encoder=encoder,
+        hidden_size=hidden_size,
+        num_labels=num_labels,
+    )
+    return model, hidden_size
 
 
 # ==================== LOAD DATA ====================
@@ -312,17 +306,24 @@ if actual_num_labels != NUM_LABELS:
     NUM_LABELS = actual_num_labels
 
 print(f"Loaded {len(df)} samples, {NUM_LABELS} classes")
+print("\nFull dataset label distribution:")
+for lbl, cnt in df['label'].value_counts().sort_index().items():
+    print(f"  Label {lbl}: {cnt:6d} ({100 * cnt / len(df):.1f}%)")
+
 all_texts  = df['comment'].tolist()
 all_labels = df['label'].tolist()
 
 
-# ==================== PRE-COMPUTE ALL LASER EMBEDDINGS ====================
+# ==================== PROBE MODEL (for hidden size / W&B config) ====================
 print("\n" + "=" * 80)
-print("PRE-COMPUTING LASER EMBEDDINGS  (all {len(all_texts)} samples)")
+print("PROBING MODEL ARCHITECTURE")
 print("=" * 80)
-print("This is done once upfront so folds reuse the same embeddings...")
-all_embeddings = encode_texts(all_texts)
-print(f"✓ Embeddings shape: {all_embeddings.shape}")
+_probe, hidden_size = load_fresh_model(NUM_LABELS)
+total_p     = sum(p.numel() for p in _probe.parameters())
+trainable_p = sum(p.numel() for p in _probe.parameters() if p.requires_grad)
+print(f"Total params    : {total_p:,}")
+print(f"Trainable params: {trainable_p:,}  ({100*trainable_p/total_p:.1f}%)")
+del _probe
 
 
 # ==================== CROSS-VALIDATION LOOP ====================
@@ -350,42 +351,21 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
     os.makedirs(fold_output_dir, exist_ok=True)
 
     # ── Split ───────────────────────────────────────────────────────────────
-    fold_train_texts  = [all_texts[i]     for i in train_idx]
-    fold_train_embeds = all_embeddings[list(train_idx)]
-    fold_train_labels = [all_labels[i]    for i in train_idx]
-
-    fold_val_texts    = [all_texts[i]     for i in val_idx]
-    fold_val_embeds   = all_embeddings[list(val_idx)]
-    fold_val_labels   = [all_labels[i]    for i in val_idx]
+    fold_train_texts  = [all_texts[i]  for i in train_idx]
+    fold_train_labels = [all_labels[i] for i in train_idx]
+    fold_val_texts    = [all_texts[i]  for i in val_idx]
+    fold_val_labels   = [all_labels[i] for i in val_idx]
 
     print(f"Train: {len(fold_train_texts)} samples  |  Val: {len(fold_val_texts)} samples")
+    print("Train label distribution (before oversampling):")
+    for lbl, cnt in sorted(Counter(fold_train_labels).items()):
+        print(f"  Label {lbl}: {cnt}")
 
     # ── Oversample (train split only) ───────────────────────────────────────
     if OVERSAMPLE_TRAIN:
-        # oversample both texts and embeddings together
-        stdlib_random.seed(RANDOM_SEED + fold_idx)
-        counts    = Counter(fold_train_labels)
-        max_count = max(counts.values())
-        bal_texts, bal_embeds, bal_labels = (
-            list(fold_train_texts),
-            list(fold_train_embeds),
-            list(fold_train_labels)
+        fold_train_texts, fold_train_labels = oversample(
+            fold_train_texts, fold_train_labels, seed=RANDOM_SEED + fold_idx
         )
-        for label, count in counts.items():
-            needed  = max_count - count
-            if needed == 0:
-                continue
-            indices = [i for i, l in enumerate(fold_train_labels) if l == label]
-            extras  = stdlib_random.choices(indices, k=needed)
-            bal_texts  += [fold_train_texts[i]  for i in extras]
-            bal_embeds += [fold_train_embeds[i] for i in extras]
-            bal_labels += [fold_train_labels[i] for i in extras]
-        combined = list(zip(bal_texts, bal_embeds, bal_labels))
-        stdlib_random.shuffle(combined)
-        fold_train_texts, fold_train_embeds, fold_train_labels = zip(*combined)
-        fold_train_texts  = list(fold_train_texts)
-        fold_train_embeds = np.stack(fold_train_embeds)
-        fold_train_labels = list(fold_train_labels)
         print(f"After oversampling: {len(fold_train_texts)} train samples")
 
     # ── Class weights (raw pre-oversample distribution) ─────────────────────
@@ -397,12 +377,16 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
             print(f"  Label {i}: {w.item():.4f}")
 
     # ── Datasets ────────────────────────────────────────────────────────────
-    train_ds = LaserEmbeddingDataset(fold_train_embeds, fold_train_labels)
-    val_ds   = LaserEmbeddingDataset(fold_val_embeds,   fold_val_labels)
+    train_ds = TextClassificationDataset(
+        fold_train_texts, fold_train_labels, tokenizer, COMMENT_MAX_LENGTH
+    )
+    val_ds = TextClassificationDataset(
+        fold_val_texts, fold_val_labels, tokenizer, COMMENT_MAX_LENGTH
+    )
 
     # ── Fresh model ─────────────────────────────────────────────────────────
     print(f"Loading fresh model for fold {fold_idx}...")
-    model = load_fresh_model(NUM_LABELS)
+    model, hidden_size = load_fresh_model(NUM_LABELS)
     total_p     = sum(p.numel() for p in model.parameters())
     trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {total_p:,} total, {trainable_p:,} trainable")
@@ -418,12 +402,11 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
             group=WANDB_GROUP,
             name=wandb_run_name,
             config={
-                "model":                  "LASER",
-                "laser_lang":             LASER_LANG,
+                "model":                  MODEL_NAME,
                 "fold":                   fold_idx,
                 "n_folds":                N_FOLDS,
-                "frozen_encoder":         True,
-                "embed_dim":              LASER_EMBED_DIM,
+                "frozen_encoder":         False,
+                "comment_max_length":     COMMENT_MAX_LENGTH,
                 "learning_rate":          LEARNING_RATE,
                 "epochs":                 NUM_EPOCHS,
                 "train_batch_size":       TRAIN_BATCH_SIZE,
@@ -438,6 +421,10 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
             },
             reinit=True,
         )
+        wandb.log({
+            "train_label_dist": wandb.Histogram(fold_train_labels),
+            "val_label_dist":   wandb.Histogram(fold_val_labels),
+        })
         if fold_idx == 1:
             wandb_group_url = f"https://wandb.ai/{run.entity}/{WANDB_PROJECT}/groups/{WANDB_GROUP}"
         print(f"W&B run: {run.get_url()}")
@@ -463,7 +450,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         metric_for_best_model="eval_f1",
         greater_is_better=True,
         save_total_limit=2,
-        fp16=False,
+        fp16=USE_FP16 and torch.cuda.is_available(),
         dataloader_num_workers=NUM_WORKERS,
         seed=RANDOM_SEED + fold_idx,
         report_to="wandb" if USE_WANDB else "none",
@@ -516,6 +503,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
     print(f"\nClassification report — Fold {fold_idx}:")
     print(classification_report(y_true, y_pred, digits=4))
 
+    # ── Save per-fold predictions ────────────────────────────────────────────
     fold_conf = [
         torch.softmax(torch.tensor(preds_out.predictions[i]), dim=0)[y_pred[i]].item()
         for i in range(len(y_pred))
@@ -528,6 +516,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         'confidence':      fold_conf,
     }).to_csv(f"{fold_output_dir}/predictions.csv", index=False)
 
+    # ── Per-class metrics ────────────────────────────────────────────────────
     prec_pc, rec_pc, f1_pc, sup_pc = precision_recall_fscore_support(
         y_true, y_pred, average=None, zero_division=0
     )
@@ -542,6 +531,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
     cm = confusion_matrix(y_true, y_pred)
     pd.DataFrame(cm).to_csv(f"{fold_output_dir}/confusion_matrix.csv")
 
+    # ── Store fold metrics ───────────────────────────────────────────────────
     fold_m = {
         'fold':        fold_idx,
         'accuracy':    eval_results['eval_accuracy'],
@@ -552,6 +542,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
     }
     fold_metrics.append(fold_m)
 
+    # ── W&B fold summary ─────────────────────────────────────────────────────
     if USE_WANDB:
         wandb.log({
             "fold_summary/accuracy":    fold_m['accuracy'],
@@ -562,12 +553,15 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         })
         try:
             import plotly.figure_factory as ff
-            fig = ff.create_annotated_heatmap(z=cm, colorscale='Blues', showscale=True)
+            fig = ff.create_annotated_heatmap(
+                z=cm, colorscale='Blues', showscale=True
+            )
             fig.update_layout(title=f"Confusion Matrix — Fold {fold_idx}")
             wandb.log({"confusion_matrix": fig})
         except ImportError:
             pass
 
+    # ── Save best model ──────────────────────────────────────────────────────
     if fold_m['f1'] > best_fold_f1:
         best_fold_f1  = fold_m['f1']
         best_fold_idx = fold_idx
@@ -575,12 +569,12 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
         torch.save(model.state_dict(), f"{BEST_MODEL_DIR}/pytorch_model.bin")
         with open(f"{BEST_MODEL_DIR}/model_info.json", "w") as fh:
             json.dump({
-                "model_name":  "LASER",
-                "laser_lang":  LASER_LANG,
-                "task":        "News Source Classification",
-                "embed_dim":   LASER_EMBED_DIM,
-                "num_labels":  NUM_LABELS,
-                "frozen_encoder": True,
+                "model_name":         MODEL_NAME,
+                "task":               "News Source Classification",
+                "hidden_size":        hidden_size,
+                "num_labels":         NUM_LABELS,
+                "comment_max_length": COMMENT_MAX_LENGTH,
+                "frozen_encoder":     False,
             }, fh, indent=2)
         print(f"\nNew best model saved (fold {fold_idx}, F1={best_fold_f1:.4f}) → {BEST_MODEL_DIR}")
 
@@ -589,6 +583,8 @@ for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_texts, all_labels)
     if USE_WANDB:
         wandb.finish()
         print(f"W&B fold {fold_idx} run finished")
+
+    model.train()
 
 
 # ==================== CROSS-VALIDATION SUMMARY ====================
@@ -635,9 +631,8 @@ print(f"OOF macro F1:    {oof_f1:.4f}")
 print(f"OOF weighted F1: {oof_f1_w:.4f}")
 print(f"OOF accuracy:    {oof_acc:.4f}")
 
-pd.DataFrame(oof_confusion_matrix := confusion_matrix(oof_y_true, oof_y_pred)).to_csv(
-    f"{OUTPUT_DIR}/oof_confusion_matrix.csv"
-)
+oof_cm = confusion_matrix(oof_y_true, oof_y_pred)
+pd.DataFrame(oof_cm).to_csv(f"{OUTPUT_DIR}/oof_confusion_matrix.csv")
 pd.DataFrame({
     'text':            all_oof_texts,
     'true_label':      oof_y_true,
@@ -648,6 +643,7 @@ pd.DataFrame({
 
 # ==================== W&B CV SUMMARY RUN ====================
 if USE_WANDB:
+    print("\nLogging CV summary to W&B...")
     wandb.init(
         project=WANDB_PROJECT,
         entity=WANDB_ENTITY,
@@ -668,19 +664,27 @@ if USE_WANDB:
         "best_fold_f1":    best_fold_f1,
         "cv_fold_metrics": wandb.Table(dataframe=metrics_df),
     })
+    try:
+        import plotly.figure_factory as ff
+        fig = ff.create_annotated_heatmap(z=oof_cm, colorscale='Blues', showscale=True)
+        fig.update_layout(title="OOF Confusion Matrix — All Folds")
+        wandb.log({"oof_confusion_matrix": fig})
+    except ImportError:
+        pass
     wandb.finish()
     print(f"CV summary logged — group: {WANDB_GROUP}")
 
 
 # ==================== FINAL SUMMARY ====================
 cv_summary = {
-    'Model':                'LASER',
-    'Frozen Encoder':       'Yes',
-    'Embed Dim':            LASER_EMBED_DIM,
+    'Model':                "XLM-R_large",
+    'HuggingFace ID':       MODEL_NAME,
+    'Frozen Encoder':       "No",
     'Task':                 "News Source Classification",
     'N Folds':              N_FOLDS,
     'Num Classes':          NUM_LABELS,
     'Total Samples':        len(all_texts),
+    'Max Length':           COMMENT_MAX_LENGTH,
     'Learning Rate':        LEARNING_RATE,
     'Effective Batch Size': TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
     'Best Fold':            best_fold_idx,
@@ -695,15 +699,26 @@ cv_summary = {
 
 pd.DataFrame([cv_summary]).to_csv(f'{OUTPUT_DIR}/cv_summary.csv', index=False)
 
-print("\n" + "=" * 80)
-print("FINAL CROSS-VALIDATION SUMMARY")
-print("=" * 80)
+final_summary_lines = []
+final_summary_lines.append("\n" + "=" * 80)
+final_summary_lines.append("FINAL CROSS-VALIDATION SUMMARY")
+final_summary_lines.append("=" * 80)
 for k, v in cv_summary.items():
-    print(f"  {k:<28}: {v}")
-
-print("\n" + "=" * 80)
-print(f"5-FOLD CV COMPLETE — LASER / News Source Classification")
-print("=" * 80)
-print(f"\nOutputs saved to: {OUTPUT_DIR}/")
+    final_summary_lines.append(f"  {k:<28}: {v}")
+final_summary_lines.append("\n" + "=" * 80)
+final_summary_lines.append(f"5-FOLD CV COMPLETE — XLM-R_large / News Source Classification")
+final_summary_lines.append("=" * 80)
+final_summary_lines.append(f"\nOutputs saved to: {OUTPUT_DIR}/")
 if USE_WANDB and wandb_group_url:
-    print(f"W&B group: {wandb_group_url}")
+    final_summary_lines.append(f"W&B group: {wandb_group_url}")
+
+final_summary_text = "\n".join(final_summary_lines)
+print(final_summary_text)
+
+# ==================== SAVE EVAL RESULTS ====================
+_eval_results_dir = os.path.join("eval_results", "XLM-R_large")
+os.makedirs(_eval_results_dir, exist_ok=True)
+_eval_results_path = os.path.join(_eval_results_dir, "news_source.txt")
+with open(_eval_results_path, "w", encoding="utf-8") as _f:
+    _f.write(final_summary_text + "\n")
+print(f"\nEval results saved to: {_eval_results_path}")

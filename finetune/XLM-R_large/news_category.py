@@ -699,15 +699,26 @@ cv_summary = {
 
 pd.DataFrame([cv_summary]).to_csv(f'{OUTPUT_DIR}/cv_summary.csv', index=False)
 
-print("\n" + "=" * 80)
-print("FINAL CROSS-VALIDATION SUMMARY")
-print("=" * 80)
+final_summary_lines = []
+final_summary_lines.append("\n" + "=" * 80)
+final_summary_lines.append("FINAL CROSS-VALIDATION SUMMARY")
+final_summary_lines.append("=" * 80)
 for k, v in cv_summary.items():
-    print(f"  {k:<28}: {v}")
-
-print("\n" + "=" * 80)
-print(f"5-FOLD CV COMPLETE — XLM-R_large / News Category Classification")
-print("=" * 80)
-print(f"\nOutputs saved to: {OUTPUT_DIR}/")
+    final_summary_lines.append(f"  {k:<28}: {v}")
+final_summary_lines.append("\n" + "=" * 80)
+final_summary_lines.append(f"5-FOLD CV COMPLETE — XLM-R_large / News Category Classification")
+final_summary_lines.append("=" * 80)
+final_summary_lines.append(f"\nOutputs saved to: {OUTPUT_DIR}/")
 if USE_WANDB and wandb_group_url:
-    print(f"W&B group: {wandb_group_url}")
+    final_summary_lines.append(f"W&B group: {wandb_group_url}")
+
+final_summary_text = "\n".join(final_summary_lines)
+print(final_summary_text)
+
+# ==================== SAVE EVAL RESULTS ====================
+_eval_results_dir = os.path.join("eval_results", "XLM-R_large")
+os.makedirs(_eval_results_dir, exist_ok=True)
+_eval_results_path = os.path.join(_eval_results_dir, "news_category.txt")
+with open(_eval_results_path, "w", encoding="utf-8") as _f:
+    _f.write(final_summary_text + "\n")
+print(f"\nEval results saved to: {_eval_results_path}")
