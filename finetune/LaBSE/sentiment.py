@@ -287,16 +287,13 @@ try:
 except pd.errors.ParserError:
     df = pd.read_csv(DATA_PATH, engine='python', on_bad_lines='skip')
 
-    df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
+df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
 
-    # flexible column detection
-    comment_hits = [c for c in df.columns if 'comment' in c.lower() or 'phrase' in c.lower()]
-    label_hits   = [c for c in df.columns if 'sentiment' in c.lower() or 'label' in c.lower()]
-    if comment_hits and label_hits:
-        df = df.rename(columns={comment_hits[0]: 'comment', label_hits[0]: 'label'})
-    else:
-        df = df.iloc[:, -2:].copy()
-        df.columns = ['comment', 'label']
+# Map dataset columns to internal names
+df = df.rename(columns={
+    'comment_phrase':    'comment',
+    'comment_sentiment': 'label',
+})
 
 df = df.drop(columns=[c for c in df.columns if 'Unnamed' in c], errors='ignore')
 df = df.dropna(subset=['comment', 'label'])
