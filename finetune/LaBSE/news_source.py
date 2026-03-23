@@ -16,7 +16,7 @@ Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • OOF report generated at end
   • W&B logging enabled
 
-Model:   FacebookAI/xlm-roberta-large
+Model:   sentence-transformers/LaBSE
 Task:    News Source Classification
 Data:    data/Sinhala-News-Source-classification/train/news_source_train.csv
 """

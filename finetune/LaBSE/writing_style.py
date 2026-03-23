@@ -16,7 +16,7 @@ Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • OOF report generated at end
   • W&B logging enabled
 
-Model:   FacebookAI/xlm-roberta-large
+Model:   sentence-transformers/LaBSE
 Task:    Writing Style Classification
 Data:    data/Writing-style-classification/train/writing_style_train.csv
 """
