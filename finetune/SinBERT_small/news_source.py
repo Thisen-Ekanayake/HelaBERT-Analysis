@@ -1,10 +1,10 @@
 """
-Fine-tuning XLM-R_large for News Source Classification — 5-Fold Cross Validation
+Fine-tuning SinBERT_small for News Source Classification — 5-Fold Cross Validation
 — Balanced training via oversampling + weighted loss —
 — Comparison baseline against HelaBERT —
 
 Architecture:
-    text → XLM-R_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
+    text → SinBERT_small encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
     (full fine-tuning)
 
 Mirrors the exact training/evaluation pipeline used for HelaBERT:
@@ -16,7 +16,7 @@ Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • OOF report generated at end
   • W&B logging enabled
 
-Model:   FacebookAI/xlm-roberta-large
+Model:   NLPC-UOM/SinBERT-small
 Task:    News Source Classification
 Data:    data/Sinhala-News-Source-classification/train/news_source_train.csv
 """
@@ -52,10 +52,10 @@ import wandb
 
 # ==================== CONFIGURATION ====================
 print("=" * 80)
-print("XLM-R_LARGE FINE-TUNING — 5-FOLD CV  [NEWS SOURCE CLASSIFICATION]")
+print("SinBERT_small FINE-TUNING — 5-FOLD CV  [NEWS SOURCE CLASSIFICATION]")
 print("=" * 80)
 
-MODEL_NAME       = "FacebookAI/xlm-roberta-large"
+MODEL_NAME       = "NLPC-UOM/SinBERT-small"
 DATA_PATH        = "data/Sinhala-News-Source-classification/train/news_source_train.csv"
 
 NUM_LABELS                   = 9
@@ -73,7 +73,7 @@ N_FOLDS           = 5
 OVERSAMPLE_TRAIN  = True
 USE_CLASS_WEIGHTS = True
 
-OUTPUT_DIR     = "XLM_R_large_finetuned_news_source_cv"
+OUTPUT_DIR     = "SinBERT_small_finetuned_news_source_cv"
 BEST_MODEL_DIR = f"{OUTPUT_DIR}/best_model"
 
 RANDOM_SEED = 42
@@ -81,7 +81,7 @@ USE_FP16    = True
 NUM_WORKERS = 2
 
 USE_WANDB      = True
-WANDB_PROJECT  = "XLM_R_large-news-source-finetuning"
+WANDB_PROJECT  = "SinBERT_small-news-source-finetuning"
 WANDB_GROUP    = f"5fold_cv_lr{LEARNING_RATE}_bs{TRAIN_BATCH_SIZE}"
 WANDB_ENTITY   = None
 
@@ -213,7 +213,7 @@ def print_metric(key, value):
 # ==================== MODEL ====================
 class ClassificationModel(nn.Module):
     """
-    XLM-R_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
+    SinBERT_small encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
 
     Mirrors HelaBERT's BaselineModel architecture exactly.
     Full fine-tuning end-to-end.
@@ -677,7 +677,7 @@ if USE_WANDB:
 
 # ==================== FINAL SUMMARY ====================
 cv_summary = {
-    'Model':                "XLM-R_large",
+    'Model':                "SinBERT_small",
     'HuggingFace ID':       MODEL_NAME,
     'Frozen Encoder':       "No",
     'Task':                 "News Source Classification",
@@ -706,7 +706,7 @@ final_summary_lines.append("=" * 80)
 for k, v in cv_summary.items():
     final_summary_lines.append(f"  {k:<28}: {v}")
 final_summary_lines.append("\n" + "=" * 80)
-final_summary_lines.append(f"5-FOLD CV COMPLETE — XLM-R_large / News Source Classification")
+final_summary_lines.append(f"5-FOLD CV COMPLETE — SinBERT_small / News Source Classification")
 final_summary_lines.append("=" * 80)
 final_summary_lines.append(f"\nOutputs saved to: {OUTPUT_DIR}/")
 if USE_WANDB and wandb_group_url:
@@ -716,7 +716,7 @@ final_summary_text = "\n".join(final_summary_lines)
 print(final_summary_text)
 
 # ==================== SAVE EVAL RESULTS ====================
-_eval_results_dir = os.path.join("eval_results", "XLM-R_large")
+_eval_results_dir = os.path.join("eval_results", "SinBERT_small")
 os.makedirs(_eval_results_dir, exist_ok=True)
 _eval_results_path = os.path.join(_eval_results_dir, "news_source.txt")
 with open(_eval_results_path, "w", encoding="utf-8") as _f:
