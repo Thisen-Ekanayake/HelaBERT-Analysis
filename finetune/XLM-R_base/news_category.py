@@ -16,7 +16,7 @@ Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • OOF report generated at end
   • W&B logging enabled
 
-Model:   XLM-R_base
+Model:   FacebookAI/xlm-roberta-base
 Task:    News Category Classification
 Data:    data/Sinhala-News-Category-classification/train/news_train.csv
 """
@@ -55,7 +55,7 @@ print("=" * 80)
 print("XLM-R_BASE FINE-TUNING — 5-FOLD CV  [NEWS CATEGORY CLASSIFICATION]")
 print("=" * 80)
 
-MODEL_NAME       = "XLM-R_base"
+MODEL_NAME       = "FacebookAI/xlm-roberta-base"
 DATA_PATH        = "data/Sinhala-News-Category-classification/train/news_train.csv"
 
 NUM_LABELS                   = 5
