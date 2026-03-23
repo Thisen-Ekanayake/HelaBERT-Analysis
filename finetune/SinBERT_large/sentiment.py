@@ -16,7 +16,7 @@ Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • OOF report generated at end
   • W&B logging enabled
 
-Model:   FacebookAI/xlm-roberta-large
+Model:   NLPC-UOM/SinBERT-large
 Task:    Sentiment Analysis
 Data:    data/sinhala-sentiment-analysis/outputs/train.csv
 """
