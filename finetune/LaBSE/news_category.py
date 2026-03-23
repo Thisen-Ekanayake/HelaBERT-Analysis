@@ -1,11 +1,11 @@
 """
-Fine-tuning XLM-R_large for News Category Classification — 5-Fold Cross Validation
+Fine-tuning LaBSE for News Category Classification — 5-Fold Cross Validation
 — Balanced training via oversampling + weighted loss —
 — Comparison baseline against HelaBERT —
 
 Architecture:
-    text → XLM-R_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
-    (full fine-tuning)
+    text → LaBSE encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
+    (encoder FROZEN — classification head only)
 
 Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • StratifiedKFold(n_splits=5) — same splits strategy
@@ -16,7 +16,7 @@ Mirrors the exact training/evaluation pipeline used for HelaBERT:
   • OOF report generated at end
   • W&B logging enabled
 
-Model:   FacebookAI/xlm-roberta-large
+Model:   sentence-transformers/LaBSE
 Task:    News Category Classification
 Data:    data/Sinhala-News-Category-classification/train/news_train.csv
 """
@@ -52,10 +52,10 @@ import wandb
 
 # ==================== CONFIGURATION ====================
 print("=" * 80)
-print("XLM-R_LARGE FINE-TUNING — 5-FOLD CV  [NEWS CATEGORY CLASSIFICATION]")
+print("LaBSE FINE-TUNING — 5-FOLD CV  [NEWS CATEGORY CLASSIFICATION]")
 print("=" * 80)
 
-MODEL_NAME       = "FacebookAI/xlm-roberta-large"
+MODEL_NAME       = "sentence-transformers/LaBSE"
 DATA_PATH        = "data/Sinhala-News-Category-classification/train/news_train.csv"
 
 NUM_LABELS                   = 5
@@ -73,7 +73,7 @@ N_FOLDS           = 5
 OVERSAMPLE_TRAIN  = True
 USE_CLASS_WEIGHTS = True
 
-OUTPUT_DIR     = "XLM_R_large_finetuned_news_category_cv"
+OUTPUT_DIR     = "LaBSE_finetuned_news_category_cv"
 BEST_MODEL_DIR = f"{OUTPUT_DIR}/best_model"
 
 RANDOM_SEED = 42
@@ -81,7 +81,7 @@ USE_FP16    = True
 NUM_WORKERS = 2
 
 USE_WANDB      = True
-WANDB_PROJECT  = "XLM_R_large-news-category-finetuning"
+WANDB_PROJECT  = "LaBSE-news-category-finetuning"
 WANDB_GROUP    = f"5fold_cv_lr{LEARNING_RATE}_bs{TRAIN_BATCH_SIZE}"
 WANDB_ENTITY   = None
 
@@ -213,7 +213,7 @@ def print_metric(key, value):
 # ==================== MODEL ====================
 class ClassificationModel(nn.Module):
     """
-    XLM-R_large encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
+    LaBSE encoder → [CLS] → LayerNorm → Dropout → Linear → num_labels
 
     Mirrors HelaBERT's BaselineModel architecture exactly.
     Full fine-tuning end-to-end.
@@ -677,7 +677,7 @@ if USE_WANDB:
 
 # ==================== FINAL SUMMARY ====================
 cv_summary = {
-    'Model':                "XLM-R_large",
+    'Model':                "LaBSE",
     'HuggingFace ID':       MODEL_NAME,
     'Frozen Encoder':       "No",
     'Task':                 "News Category Classification",
@@ -706,7 +706,7 @@ final_summary_lines.append("=" * 80)
 for k, v in cv_summary.items():
     final_summary_lines.append(f"  {k:<28}: {v}")
 final_summary_lines.append("\n" + "=" * 80)
-final_summary_lines.append(f"5-FOLD CV COMPLETE — XLM-R_large / News Category Classification")
+final_summary_lines.append(f"5-FOLD CV COMPLETE — LaBSE / News Category Classification")
 final_summary_lines.append("=" * 80)
 final_summary_lines.append(f"\nOutputs saved to: {OUTPUT_DIR}/")
 if USE_WANDB and wandb_group_url:
@@ -716,7 +716,7 @@ final_summary_text = "\n".join(final_summary_lines)
 print(final_summary_text)
 
 # ==================== SAVE EVAL RESULTS ====================
-_eval_results_dir = os.path.join("eval_results", "XLM-R_large")
+_eval_results_dir = os.path.join("eval_results", "LaBSE")
 os.makedirs(_eval_results_dir, exist_ok=True)
 _eval_results_path = os.path.join(_eval_results_dir, "news_category.txt")
 with open(_eval_results_path, "w", encoding="utf-8") as _f:
