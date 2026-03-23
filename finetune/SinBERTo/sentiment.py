@@ -62,8 +62,8 @@ NUM_LABELS                   = None  # resolved from data
 COMMENT_MAX_LENGTH           = 512
 TRAIN_BATCH_SIZE             = 4
 EVAL_BATCH_SIZE              = 8
-LEARNING_RATE                = 3e-05
-NUM_EPOCHS                   = 3
+LEARNING_RATE                = 5e-05
+NUM_EPOCHS                   = 5
 WARMUP_RATIO                 = 0.1
 WEIGHT_DECAY                 = 0.05
 GRADIENT_ACCUMULATION_STEPS  = 4    # effective batch = 16
