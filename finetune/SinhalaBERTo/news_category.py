@@ -284,34 +284,34 @@ except pd.errors.ParserError:
 
     df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
 
-    possible_comment_cols = [c for c in df.columns if 'comment' in c.lower()]
-    possible_label_cols   = [c for c in df.columns if 'label'   in c.lower()]
+    possible_comment_cols = [c for c in df.columns if 'comments' in c.lower()]
+    possible_label_cols   = [c for c in df.columns if 'labels'   in c.lower()]
     if possible_comment_cols and possible_label_cols:
-        df = df.rename(columns={possible_comment_cols[0]: 'comment', possible_label_cols[0]: 'label'})
+        df = df.rename(columns={possible_comment_cols[0]: 'comments', possible_label_cols[0]: 'labels'})
     else:
         df = df.iloc[:, -2:].copy()
-        df.columns = ['comment', 'label']
+        df.columns = ['comments', 'labels']
 
 df = df.drop(columns=[c for c in df.columns if 'Unnamed' in c], errors='ignore')
-df = df.dropna(subset=['comment', 'label'])
-df['comment'] = df['comment'].astype(str).str.strip()
-df['label'] = df['label'].astype(str).str.strip().astype(int)
-df = df[df['comment'].str.len() > 0].reset_index(drop=True)
+df = df.dropna(subset=['comments', 'labels'])
+df['comments'] = df['comments'].astype(str).str.strip()
+df['labels'] = df['labels'].astype(str).str.strip().astype(int)
+df = df[df['comments'].str.len() > 0].reset_index(drop=True)
 print(f"✓ Loaded {len(df):,} samples")
 
 # ==================== LABEL SETUP ====================
-actual_num_labels = df['label'].nunique()
+actual_num_labels = df['labels'].nunique()
 if actual_num_labels != NUM_LABELS:
     print(f"Updating NUM_LABELS: {NUM_LABELS} → {actual_num_labels}")
     NUM_LABELS = actual_num_labels
 
 print(f"Loaded {len(df)} samples, {NUM_LABELS} classes")
 print("\nFull dataset label distribution:")
-for lbl, cnt in df['label'].value_counts().sort_index().items():
+for lbl, cnt in df['labels'].value_counts().sort_index().items():
     print(f"  Label {lbl}: {cnt:6d} ({100 * cnt / len(df):.1f}%)")
 
-all_texts  = df['comment'].tolist()
-all_labels = df['label'].tolist()
+all_texts  = df['comments'].tolist()
+all_labels = df['labels'].tolist()
 
 
 # ==================== PROBE MODEL (for hidden size / W&B config) ====================

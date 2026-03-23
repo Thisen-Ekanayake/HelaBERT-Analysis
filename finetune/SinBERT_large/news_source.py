@@ -282,7 +282,7 @@ try:
 except pd.errors.ParserError:
     df = pd.read_csv(DATA_PATH, engine='python', on_bad_lines='skip')
 
-df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
+    df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
 
     possible_comment_cols = [c for c in df.columns if 'comment' in c.lower()]
     possible_label_cols   = [c for c in df.columns if 'label'   in c.lower()]
@@ -295,7 +295,7 @@ df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
 df = df.drop(columns=[c for c in df.columns if 'Unnamed' in c], errors='ignore')
 df = df.dropna(subset=['comment', 'label'])
 df['comment'] = df['comment'].astype(str).str.strip()
-    df['label'] = df['label'].astype(str).str.strip().astype(int)
+df['label'] = df['label'].astype(str).str.strip().astype(int)
 df = df[df['comment'].str.len() > 0].reset_index(drop=True)
 print(f"✓ Loaded {len(df):,} samples")
 

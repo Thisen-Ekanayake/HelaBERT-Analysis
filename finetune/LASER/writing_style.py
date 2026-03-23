@@ -290,19 +290,19 @@ except pd.errors.ParserError:
 
     df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
 
-    possible_comment_cols = [c for c in df.columns if 'comment' in c.lower()]
-    possible_label_cols   = [c for c in df.columns if 'label'   in c.lower()]
+    possible_comment_cols = [c for c in df.columns if 'comments' in c.lower()]
+    possible_label_cols   = [c for c in df.columns if 'labels'   in c.lower()]
     if possible_comment_cols and possible_label_cols:
-        df = df.rename(columns={possible_comment_cols[0]: 'comment', possible_label_cols[0]: 'label'})
+        df = df.rename(columns={possible_comment_cols[0]: 'comments', possible_label_cols[0]: 'labels'})
     else:
         df = df.iloc[:, -2:].copy()
-        df.columns = ['comment', 'label']
+        df.columns = ['comments', 'labels']
 
 df = df.drop(columns=[c for c in df.columns if 'Unnamed' in c], errors='ignore')
-df = df.dropna(subset=['comment', 'label'])
-df['comment'] = df['comment'].astype(str).str.strip()
-df['label'] = df['label'].astype(str).str.strip()
-df = df[df['comment'].str.len() > 0].reset_index(drop=True)
+df = df.dropna(subset=['comments', 'labels'])
+df['comments'] = df['comments'].astype(str).str.strip()
+df['labels'] = df['labels'].astype(str).str.strip()
+df = df[df['comments'].str.len() > 0].reset_index(drop=True)
 print(f"✓ Loaded {len(df):,} samples")
 
 # ==================== ENCODE LABELS ====================
@@ -310,8 +310,8 @@ print("\n" + "=" * 80)
 print("ENCODING LABELS")
 print("=" * 80)
 le = LabelEncoder()
-le.fit(sorted(df['label'].unique()))
-df['label_id'] = le.transform(df['label'])
+le.fit(sorted(df['labels'].unique()))
+df['label_id'] = le.transform(df['labels'])
 NUM_LABELS  = len(le.classes_)
 id_to_label = {i: lbl for i, lbl in enumerate(le.classes_)}
 
@@ -324,7 +324,7 @@ for idx, lbl in sorted(id_to_label.items()):
     cnt = (df['label_id'] == idx).sum()
     print(f"  [{idx}] {lbl:20s}: {cnt:5d}")
 
-all_texts  = df['comment'].tolist()
+all_texts  = df['comments'].tolist()
 all_labels = df['label_id'].tolist()
 
 
