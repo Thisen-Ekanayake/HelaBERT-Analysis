@@ -1,4 +1,5 @@
-HelaBERT/
+HelaBERT_small/
+HelaBERT_large/
 HelaBERT_V2/
 tokenizer/
 Sinhala-text-classification/
@@ -27,6 +28,7 @@ model_card.md
 *.txt
 *.png
 *.pdf
+*.pyc
 
 .env
 
