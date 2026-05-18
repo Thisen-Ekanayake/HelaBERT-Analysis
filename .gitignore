@@ -30,6 +30,7 @@ model_card.md
 *.pdf
 *.pyc
 *.csv
+*.md
 
 .env
 
