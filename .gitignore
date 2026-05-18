@@ -29,6 +29,7 @@ model_card.md
 *.png
 *.pdf
 *.pyc
+*.csv
 
 .env
 
