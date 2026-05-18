@@ -30,7 +30,7 @@ from safetensors.torch import load_file
 # ==================== CONFIGURATION ====================
 TOKENIZER_MODEL = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT_small/config.json"
-MODEL_DIR        = "models/new/HelaBERT_small_paper_news_category"
+MODEL_DIR        = "models/new/HelaBERT_paper_news_category"
 TEST_DATA_PATH   = "data/Sinhala-News-Category-classification/test/news_test.csv"
 
 MAX_SEQ_LENGTH = 512
