@@ -46,9 +46,9 @@ print("=" * 80)
 print("HelaBERT FINE-TUNING — NEWS SOURCE  [PAPER METHOD: 5 RANDOM SEED RUNS]")
 print("=" * 80)
 
-BERT_MODEL_PATH  = "HelaBERT"
+BERT_MODEL_PATH  = "HelaBERT_large"
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
-BERT_CONFIG_FILE = "HelaBERT/config.json"
+BERT_CONFIG_FILE = "HelaBERT_large/config.json"
 DATA_PATH        = "data/Sinhala-News-Source-classification/train/news_source_train.csv"
 
 # Paper hyperparameters (Table 3, SinBERT)
@@ -64,12 +64,12 @@ N_RUNS    = 5
 TEST_SIZE = 0.2
 
 # Output
-OUTPUT_DIR = "HelaBERT_paper_news_source"
+OUTPUT_DIR = "HelaBERT_large_paper_news_source"
 
 # W&B
 USE_WANDB     = True
-WANDB_PROJECT = "helabert-paper-method"
-WANDB_GROUP   = "news_source_5runs_lr1e-5"
+WANDB_PROJECT = "helabert_large-paper-method"
+WANDB_GROUP   = "news_source_large_5runs_lr5e-5"
 
 print(f"  LR={LEARNING_RATE}, batch={BATCH_SIZE}, epochs={NUM_EPOCHS}, "
       f"runs={N_RUNS}, test_size={TEST_SIZE}")
