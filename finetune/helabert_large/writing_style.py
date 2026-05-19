@@ -48,9 +48,9 @@ print("=" * 80)
 print("HelaBERT FINE-TUNING — WRITING STYLE  [PAPER METHOD: 5 RANDOM SEED RUNS]")
 print("=" * 80)
 
-BERT_MODEL_PATH  = "HelaBERT"
+BERT_MODEL_PATH  = "HelaBERT_large"
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
-BERT_CONFIG_FILE = "HelaBERT/config.json"
+BERT_CONFIG_FILE = "HelaBERT_large/config.json"
 DATA_PATH        = "data/Writing-style-classification/train/writing_style_train.csv"
 
 # Paper hyperparameters (Table 3, SinBERT)
@@ -68,12 +68,12 @@ N_RUNS    = 5
 TEST_SIZE = 0.2
 
 # Output
-OUTPUT_DIR = "HelaBERT_paper_writing_style"
+OUTPUT_DIR = "HelaBERT_large_paper_writing_style"
 
 # W&B
 USE_WANDB     = True
-WANDB_PROJECT = "helabert-paper-method"
-WANDB_GROUP   = "writing_style_5runs_lr1e-5"
+WANDB_PROJECT = "helabert_large-paper-method"
+WANDB_GROUP   = "writing_style_large_5runs_lr1e-5"
 
 print(f"  LR={LEARNING_RATE}, batch={BATCH_SIZE}, epochs={NUM_EPOCHS}, "
       f"runs={N_RUNS}, test_size={TEST_SIZE}")
