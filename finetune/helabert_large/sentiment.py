@@ -45,16 +45,16 @@ print("=" * 80)
 print("HelaBERT FINE-TUNING — SENTIMENT ANALYSIS  [PAPER METHOD: 5 RANDOM SEED RUNS]")
 print("=" * 80)
 
-BERT_MODEL_PATH  = "HelaBERT"
+BERT_MODEL_PATH  = "HelaBERT_large"
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
-BERT_CONFIG_FILE = "HelaBERT/config.json"
+BERT_CONFIG_FILE = "HelaBERT_large/config.json"
 DATA_PATH        = "data/sinhala-sentiment-analysis/train.csv"
 
 # Paper hyperparameters (Table 3, SinBERT)
 MAX_SEQ_LENGTH  = 512    # truncate to model max; sentiment avg ~22 tokens
 BATCH_SIZE      = 16
-LEARNING_RATE   = 3e-5
-NUM_EPOCHS      = 6
+LEARNING_RATE   = 5e-6
+NUM_EPOCHS      = 10
 DROPOUT         = 0.1
 
 # Evaluation: 5 randomly-initialized runs, 4:1 split
@@ -62,12 +62,12 @@ N_RUNS    = 5
 TEST_SIZE = 0.2          # 4:1 → 20% test
 
 # Output
-OUTPUT_DIR = "HelaBERT_paper_sentiment"
+OUTPUT_DIR = "HelaBERT_large_paper_sentiment"
 
 # W&B
 USE_WANDB     = True
-WANDB_PROJECT = "helabert-paper-method"
-WANDB_GROUP   = "sentiment_5runs_lr1e-5"
+WANDB_PROJECT = "helabert_large-paper-method"
+WANDB_GROUP   = "sentiment_large_5runs_lr3e-5"
 
 print(f"  LR={LEARNING_RATE}, batch={BATCH_SIZE}, epochs={NUM_EPOCHS}, "
       f"runs={N_RUNS}, test_size={TEST_SIZE}")
