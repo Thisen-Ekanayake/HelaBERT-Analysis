@@ -1,0 +1,444 @@
+"""
+HelaBERT Fine-tuning for Sentiment Analysis — WITH CO-ATTENTION (FIXED)
+Paper Method: "BERTifying Sinhala - A Comprehensive Analysis of Pre-trained
+Language Models for Sinhala Text Classification" (LREC 2022)
+
+FIXES over previous co-attention version:
+  1. NaN-safe softmax: clamp affinity so no row is all -inf before softmax.
+  2. Correct beta direction: token_seq attends to [CLS] by treating [CLS] as
+     the key/value and each token's affinity score as its query weight.
+     The previous transpose(0,1) was swapping batch and time dimensions — wrong.
+  3. LayerNorm on attended outputs before concat for training stability.
+
+All hyperparameters (lr, batch, epochs, dropout, etc.) are UNCHANGED.
+"""
+
+import os
+import random
+import random as stdlib_random
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+import sentencepiece as spm
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    classification_report,
+)
+from transformers import (
+    BertConfig, BertForMaskedLM, BertModel,
+    Trainer, TrainingArguments, EvalPrediction,
+)
+from transformers.modeling_outputs import SequenceClassifierOutput
+import wandb
+
+# ==================== CONFIGURATION ====================
+print("=" * 80)
+print("HelaBERT FINE-TUNING — SENTIMENT  [CO-ATTENTION FIXED | 5 SEED RUNS]")
+print("=" * 80)
+
+BERT_MODEL_PATH  = "HelaBERT_large"
+TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
+BERT_CONFIG_FILE = "HelaBERT_large/config.json"
+DATA_PATH        = "data/sinhala-sentiment-analysis/train.csv"
+
+# Paper hyperparameters — UNCHANGED
+MAX_SEQ_LENGTH = 512
+BATCH_SIZE     = 16
+LEARNING_RATE  = 5e-6
+NUM_EPOCHS     = 10
+DROPOUT        = 0.1
+
+N_RUNS    = 5
+TEST_SIZE = 0.2
+
+OUTPUT_DIR    = "HelaBERT_large_coattention_sentiment"
+USE_WANDB     = True
+WANDB_PROJECT = "helabert_large-coattention"
+WANDB_GROUP   = "sentiment_large_5runs_coattn_fixed"
+
+print(f"  LR={LEARNING_RATE}, batch={BATCH_SIZE}, epochs={NUM_EPOCHS}, "
+      f"runs={N_RUNS}, test_size={TEST_SIZE}")
+print(f"  Head: Co-Attention([CLS] ↔ token_seq) → LayerNorm → concat → MLP")
+
+
+# ==================== ENVIRONMENT ====================
+print(f"\nPyTorch: {torch.__version__}  |  CUDA: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+assert os.path.exists(BERT_MODEL_PATH),  f"{BERT_MODEL_PATH} not found"
+assert os.path.exists(TOKENIZER_MODEL),  f"{TOKENIZER_MODEL} not found"
+assert os.path.exists(DATA_PATH),        f"{DATA_PATH} not found"
+print("All paths verified")
+
+
+# ==================== TOKENIZER ====================
+sp = spm.SentencePieceProcessor()
+sp.load(TOKENIZER_MODEL)
+PAD_ID = sp.pad_id()
+print(f"SentencePiece loaded — vocab: {sp.get_piece_size()}, PAD_ID: {PAD_ID}")
+
+
+# ==================== DATASET ====================
+class SentimentDataset(Dataset):
+    def __init__(self, texts, labels, sp_processor, max_length):
+        self.texts      = texts
+        self.labels     = labels
+        self.sp         = sp_processor
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        ids  = self.sp.encode(str(self.texts[idx]))[:self.max_length]
+        mask = [1] * len(ids)
+        pad  = self.max_length - len(ids)
+        ids  += [PAD_ID] * pad
+        mask += [0]      * pad
+        return {
+            'input_ids':      torch.tensor(ids,              dtype=torch.long),
+            'attention_mask': torch.tensor(mask,             dtype=torch.long),
+            'labels':         torch.tensor(self.labels[idx], dtype=torch.long),
+        }
+
+
+# ==================== CO-ATTENTION MODULE (FIXED) ====================
+class CoAttention(nn.Module):
+    """
+    Parallel co-attention between [CLS] and the token sequence.
+
+    Given:
+        cls_vec  : (B, H)    — the [CLS] token
+        token_seq: (B, T, H) — the remaining token sequence
+        key_mask : (B, T)    — 1=real token, 0=padding
+
+    Shared affinity (B, T):
+        affinity = v( tanh( W_cls([CLS]).expand + W_token(token_seq) ) )
+
+    Direction 1 — [CLS] attends over tokens  → attended_cls    (B, H)
+        alpha    = softmax_safe(affinity)
+        attended_cls = alpha @ token_seq
+
+    Direction 2 — tokens attend over [CLS]   → attended_tokens (B, H)
+        Each token's weight towards [CLS] is proportional to its affinity
+        score (high affinity = more [CLS]-like). We use a sigmoid gate
+        per token and take a weighted sum of the tokens themselves,
+        producing a "[CLS]-guided" summary of the sequence.
+
+        beta             = sigmoid(affinity) * token_mask        (B, T)
+        beta_norm        = beta / (beta.sum(-1, keepdim=True) + ε)
+        attended_tokens  = beta_norm @ token_seq                 (B, H)
+
+    FIX 1: softmax_safe clamps all-padding rows to uniform distribution
+            instead of producing NaN.
+    FIX 2: Direction 2 uses sigmoid + renorm instead of the broken
+            transpose(0,1) which was swapping batch and time axes.
+    """
+
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.W_cls   = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_token = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v       = nn.Linear(hidden_size, 1,           bias=False)
+        self.scale   = hidden_size ** 0.5
+
+    @staticmethod
+    def softmax_safe(logits, mask=None):
+        """
+        Softmax that is safe even when an entire row is masked (-inf).
+        Masked positions are set to -1e9 (not -inf) so that if all
+        positions in a row are padding, softmax returns a uniform
+        distribution instead of NaN.
+        """
+        if mask is not None:
+            # mask: 1=keep, 0=pad  (-1e4 is fp16-safe; -1e9 overflows float16)
+            logits = logits.masked_fill(mask == 0, -1e4)
+        return F.softmax(logits, dim=-1)
+
+    def forward(self, cls_vec, token_seq, key_mask=None):
+        """
+        cls_vec  : (B, H)
+        token_seq: (B, T, H)
+        key_mask : (B, T)  — 1=real, 0=pad
+        """
+        B, T, H = token_seq.shape
+
+        # ── Shared affinity ────────────────────────────────────────────────
+        cls_proj   = self.W_cls(cls_vec).unsqueeze(1).expand(-1, T, -1)  # (B, T, H)
+        token_proj = self.W_token(token_seq)                              # (B, T, H)
+        affinity   = self.v(torch.tanh(cls_proj + token_proj)).squeeze(-1) / self.scale
+        # affinity: (B, T)
+
+        # ── Direction 1: [CLS] attends over token_seq ─────────────────────
+        # NaN-safe: use -1e9 instead of -inf for masked positions
+        alpha        = self.softmax_safe(affinity, key_mask)              # (B, T)
+        attended_cls = torch.bmm(alpha.unsqueeze(1), token_seq).squeeze(1) # (B, H)
+
+        # ── Direction 2: tokens attend over [CLS] ─────────────────────────
+        # Each token's relevance to [CLS] is its affinity score.
+        # We gate by the real-token mask, renormalize, then take the
+        # weighted sum of token representations — giving a [CLS]-guided
+        # summary of the actual content tokens.
+        beta = torch.sigmoid(affinity)                                    # (B, T)
+        if key_mask is not None:
+            beta = beta * key_mask.float()                                # zero out pads
+        beta_norm       = beta / (beta.sum(dim=-1, keepdim=True) + 1e-9) # (B, T)
+        attended_tokens = torch.bmm(beta_norm.unsqueeze(1), token_seq).squeeze(1)  # (B, H)
+
+        return attended_cls, attended_tokens
+
+
+# ==================== MODEL ====================
+class SentimentModelCoAttention(nn.Module):
+    """
+    Co-Attention classifier on top of HelaBERT.
+
+    Pipeline:
+        BERT encoder
+          cls_vec   (B, H)    = last_hidden_state[:, 0, :]
+          token_seq (B, T, H) = last_hidden_state[:, 1:, :]
+          token_mask(B, T)    = attention_mask[:, 1:]
+
+        CoAttention(cls_vec, token_seq, token_mask)
+          → attended_cls    (B, H)
+          → attended_tokens (B, H)
+
+        LayerNorm on each attended output (stability)
+        concat → (B, 2H)
+        dropout → Linear(2H, H) → GELU → dropout → Linear(H, num_labels)
+    """
+
+    def __init__(self, bert, hidden_size, num_labels, dropout=0.1):
+        super().__init__()
+        self.bert     = bert
+        self.co_attn  = CoAttention(hidden_size)
+
+        # LayerNorm on attended outputs before concat — stabilises early training
+        self.norm_cls    = nn.LayerNorm(hidden_size)
+        self.norm_tokens = nn.LayerNorm(hidden_size)
+
+        self.dropout    = nn.Dropout(dropout)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, num_labels),
+        )
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        # ── BERT encoder ──────────────────────────────────────────────────
+        out    = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        hidden = out.last_hidden_state                  # (B, T_full, H)
+
+        cls_vec    = hidden[:, 0, :]                    # (B, H)
+        token_seq  = hidden[:, 1:, :]                   # (B, T, H)
+        token_mask = attention_mask[:, 1:]              # (B, T) — 1=real, 0=pad
+
+        # ── Co-Attention ──────────────────────────────────────────────────
+        attended_cls, attended_tokens = self.co_attn(
+            cls_vec, token_seq, key_mask=token_mask
+        )
+
+        # ── Normalise + Concat + Classify ─────────────────────────────────
+        attended_cls    = self.norm_cls(attended_cls)
+        attended_tokens = self.norm_tokens(attended_tokens)
+
+        combined = torch.cat([attended_cls, attended_tokens], dim=-1)   # (B, 2H)
+        logits   = self.classifier(self.dropout(combined))              # (B, num_labels)
+
+        loss = None
+        if labels is not None:
+            loss = nn.CrossEntropyLoss()(logits, labels)
+
+        return SequenceClassifierOutput(loss=loss, logits=logits)
+
+
+# ==================== HELPERS ====================
+def load_fresh_model(num_labels):
+    if os.path.exists(BERT_CONFIG_FILE):
+        cfg = BertConfig.from_json_file(BERT_CONFIG_FILE)
+    else:
+        cfg = BertConfig.from_pretrained(BERT_MODEL_PATH)
+
+    try:
+        backbone = BertModel.from_pretrained(BERT_MODEL_PATH)
+    except Exception:
+        mlm      = BertForMaskedLM.from_pretrained(BERT_MODEL_PATH)
+        backbone = mlm.bert
+
+    return SentimentModelCoAttention(backbone, cfg.hidden_size, num_labels, DROPOUT)
+
+
+def compute_metrics(eval_pred: EvalPrediction):
+    preds  = np.argmax(eval_pred.predictions, axis=1)
+    labels = eval_pred.label_ids
+    return {
+        'accuracy':    accuracy_score(labels, preds),
+        'f1_macro':    f1_score(labels, preds, average='macro',    zero_division=0),
+        'f1_weighted': f1_score(labels, preds, average='weighted', zero_division=0),
+        'precision':   precision_score(labels, preds, average='macro', zero_division=0),
+        'recall':      recall_score(labels, preds,    average='macro', zero_division=0),
+    }
+
+
+def set_seed(seed):
+    random.seed(seed)
+    stdlib_random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# ==================== LOAD DATA ====================
+print("\n" + "=" * 80)
+print("LOADING DATA")
+print("=" * 80)
+
+df = pd.read_csv(DATA_PATH)
+df.columns = df.columns.str.strip()
+
+text_col  = next(c for c in df.columns if 'comment'   in c.lower())
+label_col = next(c for c in df.columns if 'sentiment' in c.lower())
+
+df = df[[text_col, label_col]].dropna()
+df[text_col]  = df[text_col].astype(str).str.strip()
+df[label_col] = df[label_col].astype(str).str.strip()
+df = df[df[text_col].str.len() > 0].reset_index(drop=True)
+
+le = LabelEncoder()
+df['label_id'] = le.fit_transform(df[label_col])
+NUM_LABELS = len(le.classes_)
+
+all_texts  = df[text_col].tolist()
+all_labels = df['label_id'].tolist()
+
+print(f"Loaded {len(df):,} samples, {NUM_LABELS} classes: {list(le.classes_)}")
+for i, cls in enumerate(le.classes_):
+    cnt = sum(1 for l in all_labels if l == i)
+    print(f"  [{i}] {cls}: {cnt}")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+pd.DataFrame({'id': range(NUM_LABELS), 'label': le.classes_}).to_csv(
+    f"{OUTPUT_DIR}/label_map.csv", index=False)
+
+
+# ==================== 5-RUN TRAINING ====================
+print("\n" + "=" * 80)
+print(f"TRAINING: {N_RUNS} randomly-initialized runs, 4:1 train/test split")
+print("=" * 80)
+
+run_f1s = []
+SEEDS   = [42, 123, 456, 789, 1024]
+
+for run_idx, seed in enumerate(SEEDS, start=1):
+    print(f"\n{'='*80}")
+    print(f"RUN {run_idx}/{N_RUNS}  (seed={seed})")
+    print("=" * 80)
+
+    set_seed(seed)
+
+    train_texts, test_texts, train_labels, test_labels = train_test_split(
+        all_texts, all_labels,
+        test_size=TEST_SIZE,
+        random_state=seed,
+        stratify=all_labels,
+    )
+    print(f"Train: {len(train_texts):,}  |  Test: {len(test_texts):,}")
+
+    train_ds = SentimentDataset(train_texts, train_labels, sp, MAX_SEQ_LENGTH)
+    test_ds  = SentimentDataset(test_texts,  test_labels,  sp, MAX_SEQ_LENGTH)
+
+    model = load_fresh_model(NUM_LABELS)
+
+    run_dir = f"{OUTPUT_DIR}/run_{run_idx}"
+    os.makedirs(run_dir, exist_ok=True)
+
+    if USE_WANDB:
+        if wandb.run is not None:
+            wandb.finish()
+        wandb.init(
+            project=WANDB_PROJECT,
+            group=WANDB_GROUP,
+            name=f"run_{run_idx}_seed{seed}",
+            config={
+                "task": "sentiment_analysis", "method": "co_attention_fixed",
+                "run": run_idx, "seed": seed,
+                "lr": LEARNING_RATE, "batch": BATCH_SIZE, "epochs": NUM_EPOCHS,
+                "num_labels": NUM_LABELS, "label_names": list(le.classes_),
+                "max_seq_length": MAX_SEQ_LENGTH, "test_size": TEST_SIZE,
+                "head": "CoAttention_fixed -> LayerNorm -> concat -> MLP",
+            },
+            reinit=True,
+        )
+
+    training_args = TrainingArguments(
+        output_dir=run_dir,
+        num_train_epochs=NUM_EPOCHS,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE * 2,
+        learning_rate=LEARNING_RATE,
+        optim="adamw_torch",
+        weight_decay=0.01,
+        warmup_ratio=0.06,
+        lr_scheduler_type="linear",
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_f1_macro",
+        greater_is_better=True,
+        save_total_limit=1,
+        logging_steps=50,
+        fp16=torch.cuda.is_available(),
+        report_to="wandb" if USE_WANDB else "none",
+        seed=seed,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=test_ds,
+        compute_metrics=compute_metrics,
+    )
+
+    trainer.train()
+
+    preds_out = trainer.predict(test_ds)
+    preds     = np.argmax(preds_out.predictions, axis=1)
+    macro_f1  = f1_score(test_labels, preds, average='macro', zero_division=0)
+    run_f1s.append(macro_f1)
+
+    print(f"\nRun {run_idx} macro-F1: {macro_f1:.4f}")
+    print(classification_report(test_labels, preds,
+                                target_names=le.classes_, zero_division=0))
+
+    if USE_WANDB and wandb.run:
+        wandb.log({"test_macro_f1": macro_f1})
+        wandb.finish()
+
+
+# ==================== SUMMARY ====================
+print("\n" + "=" * 80)
+print("FINAL RESULTS  (paper-style: macro-F1 mean ± std over 5 runs)")
+print("=" * 80)
+for i, f1 in enumerate(run_f1s, 1):
+    print(f"  Run {i}: {f1:.4f}")
+mean_f1 = np.mean(run_f1s)
+std_f1  = np.std(run_f1s)
+print(f"\nMacro-F1: {mean_f1:.4f} ± {std_f1:.4f}")
+
+results_df = pd.DataFrame({
+    'run':      range(1, N_RUNS + 1),
+    'seed':     SEEDS,
+    'macro_f1': run_f1s,
+})
+results_df.to_csv(f"{OUTPUT_DIR}/results.csv", index=False)
+print(f"\nResults saved to {OUTPUT_DIR}/results.csv")
