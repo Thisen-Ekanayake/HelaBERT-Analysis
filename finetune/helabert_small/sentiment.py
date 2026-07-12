@@ -53,8 +53,8 @@ DATA_PATH        = "data/sinhala-sentiment-analysis/train.csv"
 # Paper hyperparameters (Table 3, SinBERT)
 MAX_SEQ_LENGTH  = 512    # truncate to model max; sentiment avg ~22 tokens
 BATCH_SIZE      = 16
-LEARNING_RATE   = 3e-5
-NUM_EPOCHS      = 6
+LEARNING_RATE   = 5e-6
+NUM_EPOCHS      = 10
 DROPOUT         = 0.1
 
 # Evaluation: 5 randomly-initialized runs, 4:1 split
