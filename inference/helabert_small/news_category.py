@@ -189,7 +189,7 @@ print(f"  Weighted-F1: {f1_weighted:.4f}")
 print(f"  Precision:   {precision:.4f}")
 print(f"  Recall:      {recall:.4f}")
 print()
-print(classification_report(all_labels, all_preds, target_names=label_names, zero_division=0))
+print(classification_report(all_labels, all_preds, target_names=label_names, zero_division=0, digits=4))
 
 
 # ==================== SAVE RESULTS ====================
