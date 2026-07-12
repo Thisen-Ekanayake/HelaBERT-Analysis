@@ -375,7 +375,7 @@ for run_idx, seed in enumerate(SEEDS, start=1):
     preds_out = trainer.predict(test_ds)
     preds     = np.argmax(preds_out.predictions, axis=1)
     macro_f1  = f1_score(test_labels, preds, average='macro', zero_division=0)
-    run_f1s.append(macro_f1)
+    run_f1s.append(round(macro_f1, 4))
 
     print(f"\nRun {run_idx} macro-F1: {macro_f1:.4f}")
     print(classification_report(test_labels, preds,
