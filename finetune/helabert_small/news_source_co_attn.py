@@ -47,9 +47,9 @@ print("=" * 80)
 print("HelaBERT FINE-TUNING — NEWS SOURCE  [CO-ATTENTION | 5 SEED RUNS]")
 print("=" * 80)
 
-BERT_MODEL_PATH  = "HelaBERT"
+BERT_MODEL_PATH  = "HelaBERT_small"
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
-BERT_CONFIG_FILE = "HelaBERT/config.json"
+BERT_CONFIG_FILE = "HelaBERT_small/config.json"
 DATA_PATH        = "data/Sinhala-News-Source-classification/train/news_source_train.csv"
 
 # Paper hyperparameters — UNCHANGED
