@@ -30,7 +30,7 @@ from safetensors.torch import load_file
 # ==================== CONFIGURATION ====================
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT_large/config.json"
-MODEL_DIR        = "models/new/large/HelaBERT_large_paper_writing_style"
+MODEL_DIR        = "HelaBERT_large_paper_writing_style"
 TEST_DATA_PATH   = "data/Writing-style-classification/test/writing_style_test.csv"
 
 MAX_SEQ_LENGTH = 512
