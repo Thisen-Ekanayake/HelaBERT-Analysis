@@ -85,20 +85,6 @@ class NewsSourceModel(nn.Module):
         return logits
 
 
-# ==================== LOAD MODEL ====================
-cfg   = BertConfig.from_json_file(BERT_CONFIG_FILE)
-bert  = BertModel(cfg)
-model = NewsSourceModel(bert, cfg.hidden_size, num_labels, DROPOUT)
-
-state_dict = load_file(os.path.join(checkpoint_dir, "model.safetensors"))
-model.load_state_dict(state_dict)
-model.eval()
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
-print(f"Model loaded on {device}")
-
-
 # ==================== LOAD TEST DATA ====================
 df = pd.read_csv(TEST_DATA_PATH)
 df.columns = df.columns.str.strip()
@@ -142,35 +128,76 @@ class TextDataset(Dataset):
         }
 
 
-# ==================== INFERENCE ====================
 dataset = TextDataset(texts, label_ids, sp, MAX_SEQ_LENGTH)
 loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
 
-all_preds  = []
-all_labels = []
 
-print("\nRunning inference...")
-with torch.no_grad():
-    for batch in loader:
-        input_ids      = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        logits = model(input_ids, attention_mask)
-        preds  = logits.argmax(dim=-1).cpu().numpy()
-        all_preds.extend(preds)
-        all_labels.extend(batch['label'].numpy())
-
-all_preds  = np.array(all_preds)
-all_labels = np.array(all_labels)
+# ==================== MODEL ====================
+cfg    = BertConfig.from_json_file(BERT_CONFIG_FILE)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
 
 
-# ==================== METRICS ====================
+def run_inference(checkpoint_dir):
+    bert  = BertModel(cfg)
+    model = NewsSourceModel(bert, cfg.hidden_size, num_labels, DROPOUT)
+
+    state_dict = load_file(os.path.join(checkpoint_dir, "model.safetensors"))
+    model.load_state_dict(state_dict)
+    model.eval()
+    model.to(device)
+
+    preds_list  = []
+    labels_list = []
+    with torch.no_grad():
+        for batch in loader:
+            input_ids      = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            logits = model(input_ids, attention_mask)
+            preds  = logits.argmax(dim=-1).cpu().numpy()
+            preds_list.extend(preds)
+            labels_list.extend(batch['label'].numpy())
+    return np.array(preds_list), np.array(labels_list)
+
+
+# ==================== EVALUATE ALL 5 SEEDS ====================
 label_names = [str(id_to_label[i]) for i in range(num_labels)]
+metric_names = ['accuracy', 'f1_macro', 'f1_weighted', 'precision', 'recall']
 
-accuracy    = accuracy_score(all_labels, all_preds)
-f1_macro    = f1_score(all_labels, all_preds, average='macro',    zero_division=0)
-f1_weighted = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
-precision   = precision_score(all_labels, all_preds, average='macro', zero_division=0)
-recall      = recall_score(all_labels, all_preds,    average='macro', zero_division=0)
+per_run_records = []
+best_preds, best_labels = None, None
+
+print("\nRunning inference across all seeds...")
+for _, row in results_df.iterrows():
+    run_idx_i = int(row['run'])
+    run_dir_i = f"{MODEL_DIR}/run_{run_idx_i}"
+    checkpoints_i = [d for d in os.listdir(run_dir_i) if d.startswith("checkpoint")]
+    assert checkpoints_i, f"No checkpoint found in {run_dir_i}"
+    checkpoint_dir_i = os.path.join(run_dir_i, sorted(checkpoints_i)[-1])
+
+    preds_i, labels_i = run_inference(checkpoint_dir_i)
+
+    acc_i  = accuracy_score(labels_i, preds_i)
+    f1m_i  = f1_score(labels_i, preds_i, average='macro',    zero_division=0)
+    f1w_i  = f1_score(labels_i, preds_i, average='weighted', zero_division=0)
+    prec_i = precision_score(labels_i, preds_i, average='macro', zero_division=0)
+    rec_i  = recall_score(labels_i, preds_i,    average='macro', zero_division=0)
+
+    per_run_records.append({
+        'run': run_idx_i, 'seed': row['seed'], 'checkpoint': checkpoint_dir_i,
+        'accuracy': round(acc_i, 4), 'f1_macro': round(f1m_i, 4),
+        'f1_weighted': round(f1w_i, 4), 'precision': round(prec_i, 4), 'recall': round(rec_i, 4),
+    })
+    print(f"  run_{run_idx_i} (seed={row['seed']}): "
+          f"acc={acc_i:.4f}  f1_macro={f1m_i:.4f}  f1_weighted={f1w_i:.4f}  "
+          f"precision={prec_i:.4f}  recall={rec_i:.4f}")
+
+    if run_idx_i == best_run:
+        best_preds, best_labels = preds_i, labels_i
+        accuracy, f1_macro, f1_weighted, precision, recall = acc_i, f1m_i, f1w_i, prec_i, rec_i
+        checkpoint_dir = checkpoint_dir_i
+
+all_preds, all_labels = best_preds, best_labels
 
 print("\n" + "=" * 80)
 print("TEST RESULTS — NEWS SOURCE CLASSIFICATION")
@@ -182,6 +209,19 @@ print(f"  Precision:   {precision:.4f}")
 print(f"  Recall:      {recall:.4f}")
 print()
 print(classification_report(all_labels, all_preds, target_names=label_names, zero_division=0, digits=4))
+
+
+# ==================== MEAN ± STD OVER 5 SEEDS (TEST SET) ====================
+per_run_df = pd.DataFrame(per_run_records)
+print("\n" + "=" * 80)
+print("TEST RESULTS — MEAN ± STD OVER 5 SEEDS")
+print("=" * 80)
+mean_std_summary = {}
+for metric in metric_names:
+    m = float(np.mean(per_run_df[metric]))
+    s = float(np.std(per_run_df[metric]))
+    mean_std_summary[metric] = (m, s)
+    print(f"  {metric:12s}: {m:.4f} ± {s:.4f}")
 
 
 # ==================== SAVE RESULTS ====================
@@ -200,4 +240,12 @@ summary = pd.DataFrame([{
     'recall':      round(recall,      4),
 }])
 summary.to_csv(f"{OUTPUT_DIR}/results.csv", index=False)
-print(f"Results saved to {OUTPUT_DIR}/results.csv")
+print(f"\nResults saved to {OUTPUT_DIR}/results.csv")
+
+mean_std_row = {'run': 'mean_std', 'seed': '', 'checkpoint': ''}
+for metric in metric_names:
+    m, s = mean_std_summary[metric]
+    mean_std_row[metric] = f"{m:.4f} ± {s:.4f}"
+per_seed_df = pd.concat([per_run_df, pd.DataFrame([mean_std_row])], ignore_index=True)
+per_seed_df.to_csv(f"{OUTPUT_DIR}/results_per_seed.csv", index=False)
+print(f"Per-seed results + mean±std saved to {OUTPUT_DIR}/results_per_seed.csv")

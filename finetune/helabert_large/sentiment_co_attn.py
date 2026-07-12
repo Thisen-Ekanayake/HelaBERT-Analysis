@@ -442,3 +442,11 @@ results_df = pd.DataFrame({
 })
 results_df.to_csv(f"{OUTPUT_DIR}/results.csv", index=False)
 print(f"\nResults saved to {OUTPUT_DIR}/results.csv")
+
+with open(f"{OUTPUT_DIR}/results.txt", "w") as f:
+    f.write("FINAL RESULTS  (paper-style: macro-F1 mean \u00b1 std over 5 runs)\n")
+    f.write("=" * 80 + "\n")
+    for i, f1 in enumerate(run_f1s, 1):
+        f.write(f"  Run {i}: {f1:.4f}\n")
+    f.write(f"\nMacro-F1: {mean_f1:.4f} \u00b1 {std_f1:.4f}\n")
+print(f"Summary saved to {OUTPUT_DIR}/results.txt")
