@@ -10,6 +10,7 @@ Text col:    comment_phrase   |  Label col: comment_sentiment
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 import torch
@@ -35,6 +36,26 @@ BATCH_SIZE     = 32
 DROPOUT        = 0.1
 
 OUTPUT_DIR = "results_test/HelaBERT_small_sentiment"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+class _Tee:
+    """Duplicates writes to multiple streams (console + log file)."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
+sys.stdout = _Tee(sys.stdout, open(f"{OUTPUT_DIR}/terminal_output.txt", "w"))
+
 
 print("=" * 80)
 print("HelaBERT INFERENCE — SENTIMENT ANALYSIS")

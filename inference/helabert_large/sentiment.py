@@ -11,6 +11,7 @@ Base model:  HelaBERT_large (hidden_size=768)
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 import torch
@@ -35,6 +36,26 @@ BATCH_SIZE     = 32
 DROPOUT        = 0.1
 
 OUTPUT_DIR = "results_test/HelaBERT_large_sentiment"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+class _Tee:
+    """Duplicates writes to multiple streams (console + log file)."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
+sys.stdout = _Tee(sys.stdout, open(f"{OUTPUT_DIR}/terminal_output.txt", "w"))
+
 
 print("=" * 80)
 print("HelaBERT_large INFERENCE — SENTIMENT ANALYSIS")
