@@ -53,7 +53,7 @@ DATA_PATH        = "data/Sinhala-News-Category-classification/train/news_train.c
 # Paper hyperparameters (Table 3, SinBERT)
 MAX_SEQ_LENGTH = 512    # sentences are short (~23 tokens avg) — 512 is sufficient
 BATCH_SIZE     = 16
-LEARNING_RATE  = 1e-5
+LEARNING_RATE  = 3e-5
 NUM_EPOCHS     = 10
 DROPOUT        = 0.1
 NUM_LABELS     = 5      # Business, Political, Entertainment, Sci&Tech, Sports

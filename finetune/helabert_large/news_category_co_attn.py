@@ -55,7 +55,7 @@ DATA_PATH        = "data/Sinhala-News-Category-classification/train/news_train.c
 MAX_SEQ_LENGTH = 512
 BATCH_SIZE     = 16
 LEARNING_RATE  = 3e-5
-NUM_EPOCHS     = 3
+NUM_EPOCHS     = 10
 DROPOUT        = 0.1
 NUM_LABELS     = 5
 
