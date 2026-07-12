@@ -7,6 +7,8 @@ SinBERT-large/
 SinBERT-small/
 data/
 finetuned_models/
+logs/
+paper/
 
 models/
 
@@ -32,6 +34,7 @@ model_card.md
 *.csv
 *.md
 *.tex
+*.tar.*
 
 .env
 
