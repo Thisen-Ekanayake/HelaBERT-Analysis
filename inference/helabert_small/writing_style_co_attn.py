@@ -33,14 +33,14 @@ from safetensors.torch import load_file
 # ==================== CONFIGURATION ====================
 TOKENIZER_MODEL  = "tokenizer/unigram_32000_0.9995.model"
 BERT_CONFIG_FILE = "HelaBERT_small/config.json"
-MODEL_DIR        = "HelaBERT_coattention_writing_style"
+MODEL_DIR        = "HelaBERT_coattention_writing_style_clsconcat"
 TEST_DATA_PATH   = "data/Writing-style-classification/test/writing_style_test.csv"
 
 MAX_SEQ_LENGTH = 512
 BATCH_SIZE     = 32
 DROPOUT        = 0.1
 
-OUTPUT_DIR = "results_test/HelaBERT_small_coattention_writing_style"
+OUTPUT_DIR = "results_test/HelaBERT_small_coattention_writing_style_clsconcat"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -139,7 +139,7 @@ class WritingStyleModelCoAttention(nn.Module):
         self.norm_tokens = nn.LayerNorm(hidden_size)
         self.dropout     = nn.Dropout(dropout)
         self.classifier  = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Linear(hidden_size * 3, hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, num_labels),
@@ -160,7 +160,9 @@ class WritingStyleModelCoAttention(nn.Module):
         attended_cls    = self.norm_cls(attended_cls)
         attended_tokens = self.norm_tokens(attended_tokens)
 
-        combined = torch.cat([attended_cls, attended_tokens], dim=-1)
+        # [c; c̃; T̃] — raw [CLS] concatenated with the two attended streams
+        # (matches the 3H finetune head; needed to load the retagged checkpoint)
+        combined = torch.cat([cls_vec, attended_cls, attended_tokens], dim=-1)
         logits   = self.classifier(self.dropout(combined))
         return logits
 

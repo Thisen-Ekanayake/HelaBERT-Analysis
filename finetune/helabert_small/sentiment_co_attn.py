@@ -16,8 +16,8 @@ Architecture:
       → attended_cls    (B, H)   — [CLS] attends over token_seq via softmax
       → attended_tokens (B, H)   — token_seq attends over [CLS] via sigmoid gate
 
-    LayerNorm → concat → (B, 2H)
-    dropout → Linear(2H, H) → GELU → dropout → Linear(H, num_labels)
+    LayerNorm → concat → (B, 3H)
+    dropout → Linear(3H, H) → GELU → dropout → Linear(H, num_labels)
 """
 
 import os
@@ -64,14 +64,14 @@ DROPOUT        = 0.1
 N_RUNS    = 5
 TEST_SIZE = 0.2
 
-OUTPUT_DIR    = "HelaBERT_coattention_sentiment"
+OUTPUT_DIR    = "HelaBERT_coattention_sentiment_clsconcat"
 USE_WANDB     = True
 WANDB_PROJECT = "helabert-coattention"
-WANDB_GROUP   = "sentiment_small_5runs_coattn"
+WANDB_GROUP   = "sentiment_small_5runs_coattn_clsconcat"
 
 print(f"  LR={LEARNING_RATE}, batch={BATCH_SIZE}, epochs={NUM_EPOCHS}, "
       f"runs={N_RUNS}, test_size={TEST_SIZE}")
-print(f"  Head: Co-Attention([CLS] ↔ token_seq) → LayerNorm → concat → MLP")
+print(f"  Head: Co-Attention → concat[c; c̃; T̃] (raw CLS + attended CLS + attended tokens) → MLP")
 
 
 # ==================== ENVIRONMENT ====================
@@ -189,8 +189,8 @@ class SentimentModelCoAttention(nn.Module):
     Pipeline:
         BERT encoder → cls_vec + token_seq
         CoAttention → attended_cls + attended_tokens
-        LayerNorm → concat → (B, 2H)
-        dropout → Linear(2H, H) → GELU → dropout → Linear(H, num_labels)
+        LayerNorm → concat → (B, 3H)
+        dropout → Linear(3H, H) → GELU → dropout → Linear(H, num_labels)
     """
 
     def __init__(self, bert, hidden_size, num_labels, dropout=0.1):
@@ -203,7 +203,7 @@ class SentimentModelCoAttention(nn.Module):
 
         self.dropout    = nn.Dropout(dropout)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Linear(hidden_size * 3, hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, num_labels),
@@ -227,7 +227,12 @@ class SentimentModelCoAttention(nn.Module):
         attended_cls    = self.norm_cls(attended_cls)
         attended_tokens = self.norm_tokens(attended_tokens)
 
-        combined = torch.cat([attended_cls, attended_tokens], dim=-1)    # (B, 2H)
+        # [c; c̃; T̃]: retain the raw [CLS] vector alongside the two attended
+        # streams so the head strictly generalises the plain-[CLS] baseline
+        # (reviewer fix for the discarded-[CLS] issue). c is left un-normalised
+        # — BERT's final layer already ends in LayerNorm so scales match, and
+        # keeping c raw lets the classifier recover the baseline exactly.
+        combined = torch.cat([cls_vec, attended_cls, attended_tokens], dim=-1)    # (B, 3H)
         logits   = self.classifier(self.dropout(combined))               # (B, num_labels)
 
         loss = None
@@ -346,13 +351,13 @@ for run_idx, seed in enumerate(SEEDS, start=1):
             group=WANDB_GROUP,
             name=f"run_{run_idx}_seed{seed}",
             config={
-                "task": "sentiment_analysis", "method": "co_attention",
+                "task": "sentiment_analysis", "method": "co_attention_clsconcat",
                 "model": "HelaBERT_small",
                 "run": run_idx, "seed": seed,
                 "lr": LEARNING_RATE, "batch": BATCH_SIZE, "epochs": NUM_EPOCHS,
                 "num_labels": NUM_LABELS, "label_names": list(le.classes_),
                 "max_seq_length": MAX_SEQ_LENGTH, "test_size": TEST_SIZE,
-                "head": "CoAttention -> LayerNorm -> concat -> MLP",
+                "head": "CoAttention -> concat[raw_cls; attended_cls; attended_tokens] (3H) -> MLP",
             },
             reinit=True,
         )
