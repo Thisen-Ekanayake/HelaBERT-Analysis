@@ -7,7 +7,7 @@ Co-Attention head (same design as sentiment_co_attn.py):
   BERT encoder
     cls_vec   (B, H)    = last_hidden_state[:, 0, :]
     token_seq (B, T, H) = last_hidden_state[:, 1:, :]
-  CoAttention([CLS] ↔ token_seq) → LayerNorm → concat → MLP
+  CoAttention([CLS] ↔ token_seq) → concat[c; c̃; T̃] (raw CLS + attended) → MLP
 
 All hyperparameters (lr, batch, epochs, dropout, etc.) are UNCHANGED from
 the paper baseline (news_category.py).
@@ -62,14 +62,14 @@ NUM_LABELS     = 5
 N_RUNS    = 5
 TEST_SIZE = 0.2
 
-OUTPUT_DIR    = "HelaBERT_large_coattention_news_category"
+OUTPUT_DIR    = "HelaBERT_large_coattention_news_category_clsconcat"
 USE_WANDB     = True
 WANDB_PROJECT = "helabert_large-coattention"
-WANDB_GROUP   = "news_category_large_5runs_coattn_fixed"
+WANDB_GROUP   = "news_category_large_5runs_coattn_clsconcat"
 
 print(f"  LR={LEARNING_RATE}, batch={BATCH_SIZE}, epochs={NUM_EPOCHS}, "
       f"runs={N_RUNS}, test_size={TEST_SIZE}")
-print(f"  Head: Co-Attention([CLS] ↔ token_seq) → LayerNorm → concat → MLP")
+print(f"  Head: Co-Attention → concat[c; c̃; T̃] (raw CLS + attended CLS + attended tokens) → MLP")
 
 
 # ==================== ENVIRONMENT ====================
@@ -163,7 +163,7 @@ class NewsCategoryModelCoAttention(nn.Module):
     Co-Attention classifier on top of HelaBERT.
 
     Pipeline:
-        BERT encoder → CoAttention → LayerNorm → concat(2H) → dropout → MLP → num_labels
+        BERT encoder → CoAttention → LayerNorm → concat[c; c̃; T̃] (3H) → dropout → MLP → num_labels
     """
 
     def __init__(self, bert, hidden_size, num_labels, dropout=0.1):
@@ -176,7 +176,7 @@ class NewsCategoryModelCoAttention(nn.Module):
 
         self.dropout    = nn.Dropout(dropout)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Linear(hidden_size * 3, hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, num_labels),
@@ -197,7 +197,12 @@ class NewsCategoryModelCoAttention(nn.Module):
         attended_cls    = self.norm_cls(attended_cls)
         attended_tokens = self.norm_tokens(attended_tokens)
 
-        combined = torch.cat([attended_cls, attended_tokens], dim=-1)
+        # [c; c̃; T̃]: retain the raw [CLS] vector alongside the two attended
+        # streams so the head strictly generalises the plain-[CLS] baseline
+        # (reviewer fix for the discarded-[CLS] issue). c is left un-normalised
+        # — BERT's final layer already ends in LayerNorm so scales match, and
+        # keeping c raw lets the classifier recover the baseline exactly.
+        combined = torch.cat([cls_vec, attended_cls, attended_tokens], dim=-1)
         logits   = self.classifier(self.dropout(combined))
 
         loss = None
@@ -320,12 +325,12 @@ for run_idx, seed in enumerate(SEEDS, start=1):
             group=WANDB_GROUP,
             name=f"run_{run_idx}_seed{seed}",
             config={
-                "task": "news_category", "method": "co_attention_fixed",
+                "task": "news_category", "method": "co_attention_clsconcat",
                 "run": run_idx, "seed": seed,
                 "lr": LEARNING_RATE, "batch": BATCH_SIZE, "epochs": NUM_EPOCHS,
                 "num_labels": NUM_LABELS, "label_names": list(le.classes_),
                 "max_seq_length": MAX_SEQ_LENGTH, "test_size": TEST_SIZE,
-                "head": "CoAttention_fixed -> LayerNorm -> concat -> MLP",
+                "head": "CoAttention -> concat[raw_cls; attended_cls; attended_tokens] (3H) -> MLP",
             },
             reinit=True,
         )
